@@ -1,0 +1,10 @@
+ARG UPSTREAM_IMAGE=boredazfcuk/icloudpd:latest
+FROM ${UPSTREAM_IMAGE}
+
+USER root
+COPY . /src/icloudpd
+RUN /opt/icloudpd/bin/pip install --no-cache-dir --force-reinstall /src/icloudpd \
+    && rm -rf /src/icloudpd
+
+LABEL org.opencontainers.image.source="https://github.com/tural-ali/icloudpd-zone-fix"
+LABEL org.opencontainers.image.description="Unraid-compatible iCloudPD with dynamic Apple Photos zone discovery"
