@@ -5,10 +5,11 @@ Delete any files found in "Recently Deleted"
 import datetime
 import logging
 import os
-from typing import Callable, Sequence, Set
+from typing import Callable, Dict, List, Sequence, Set
 
 from tzlocal import get_localzone
 
+from icloudpd import graduation
 from icloudpd.paths import local_download_path
 from pyicloud_ipd.asset_version import calculate_version_filename
 from pyicloud_ipd.raw_policy import RawTreatmentPolicy
@@ -28,6 +29,14 @@ def delete_file_dry_run(logger: logging.Logger, path: str) -> bool:
     """Dry run deletion of files"""
     logger.info("[DRY RUN] Would delete %s", path)
     return True
+
+
+def note_graduated(graduated_sizes: Dict[str, List[int]], path: str, size: int) -> None:
+    """A path a graduated copy of this media file may have, with its size"""
+    graduated_sizes.setdefault(path, []).append(size)
+    # The name a second asset of the same name gets under name-size-dedup-with-suffix.
+    suffixed = f"-{size}.".join(path.rsplit(".", 1))
+    graduated_sizes.setdefault(suffixed, []).append(size)
 
 
 def autodelete_photos(
@@ -78,6 +87,9 @@ def autodelete_photos(
         download_dir = os.path.join(directory, date_path)
 
         paths: Set[str] = set({})
+        # Each media file's path with the sizes it may have, for a file that
+        # graduated out of the folder; see graduation.py.
+        graduated_sizes: Dict[str, List[int]] = {}
         _size: VersionSize
         versions, filename_overrides = disambiguate_filenames(
             media.versions_with_raw_policy(raw_policy), _sizes, media, lp_filename_generator
@@ -96,6 +108,11 @@ def autodelete_photos(
                 paths.add(
                     os.path.normpath(local_download_path(version_filename, download_dir)) + ".xmp"
                 )
+                note_graduated(
+                    graduated_sizes,
+                    os.path.normpath(local_download_path(version_filename, download_dir)),
+                    _version.size,
+                )
         for _size, _version in media.versions_with_raw_policy(raw_policy).items():
             if _size not in [AssetVersionSize.ALTERNATIVE, AssetVersionSize.ADJUSTED]:
                 version_filename = calculate_version_filename(
@@ -109,8 +126,17 @@ def autodelete_photos(
                 paths.add(
                     os.path.normpath(local_download_path(version_filename, download_dir)) + ".xmp"
                 )
+                note_graduated(
+                    graduated_sizes,
+                    os.path.normpath(local_download_path(version_filename, download_dir)),
+                    _version.size,
+                )
         for path in paths:
             if os.path.exists(path):
                 logger.debug("Deleting %s...", path)
                 delete_local = delete_file_dry_run if dry_run else delete_file
                 delete_local(logger, path)
+        graduated = graduation.for_directory(directory)
+        for path, sizes in graduated_sizes.items():
+            if not os.path.exists(path):
+                graduated.report_deletion(logger, path, sizes, dry_run)

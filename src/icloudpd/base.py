@@ -38,7 +38,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from tzlocal import get_localzone
 
 from foundation.core import compose, identity, map_, partial_1_1
-from icloudpd import download, exif_datetime
+from icloudpd import download, exif_datetime, graduation
 from icloudpd.authentication import authenticator
 from icloudpd.autodelete import autodelete_photos
 from icloudpd.config import GlobalConfig, UserConfig
@@ -661,24 +661,26 @@ def download_builder(
 
         download_path = local_download_path(filename, download_dir)
 
+        # A file moved out on purpose still counts as downloaded; see graduation.py.
+        graduated = graduation.for_directory(directory)
         original_download_path = None
-        file_exists = os.path.isfile(download_path)
+        file_exists = graduated.exists(download_path)
         if not file_exists and download_size == AssetVersionSize.ORIGINAL:
             # Deprecation - We used to download files like IMG_1234-original.jpg,
             # so we need to check for these.
             # Now we match the behavior of iCloud for Windows: IMG_1234.jpg
             original_download_path = add_suffix_to_filename("-original", download_path)
-            file_exists = os.path.isfile(original_download_path)
+            file_exists = graduated.exists(original_download_path)
 
         if file_exists:
             if file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX:
                 # for later: this crashes if download-size medium is specified
-                file_size = os.stat(original_download_path or download_path).st_size
+                file_size = graduated.size(original_download_path or download_path)
                 photo_size = version.size
                 if file_size != photo_size:
                     download_path = (f"-{photo_size}.").join(download_path.rsplit(".", 1))
                     logger.debug("%s deduplicated", truncate_middle(download_path, 96))
-                    file_exists = os.path.isfile(download_path)
+                    file_exists = graduated.exists(download_path)
             if file_exists:
                 counter.increment()
                 logger.debug("%s already exists", truncate_middle(download_path, 96))
@@ -754,7 +756,8 @@ def download_builder(
                 pass
             lp_download_path = os.path.join(download_dir, lp_filename)
 
-            lp_file_exists = os.path.isfile(lp_download_path)
+            graduated = graduation.for_directory(directory)
+            lp_file_exists = graduated.exists(lp_download_path)
 
             if only_print_filenames:
                 if not lp_file_exists:
@@ -764,7 +767,7 @@ def download_builder(
                     lp_file_exists
                     and file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX
                 ):
-                    lp_file_size = os.stat(lp_download_path).st_size
+                    lp_file_size = graduated.size(lp_download_path)
                     lp_photo_size = version.size
                     if lp_file_size != lp_photo_size:
                         lp_download_path = (f"-{lp_photo_size}.").join(
@@ -776,14 +779,14 @@ def download_builder(
             else:
                 if lp_file_exists:
                     if file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX:
-                        lp_file_size = os.stat(lp_download_path).st_size
+                        lp_file_size = graduated.size(lp_download_path)
                         lp_photo_size = version.size
                         if lp_file_size != lp_photo_size:
                             lp_download_path = (f"-{lp_photo_size}.").join(
                                 lp_download_path.rsplit(".", 1)
                             )
                             logger.debug("%s deduplicated", truncate_middle(lp_download_path, 96))
-                            lp_file_exists = os.path.isfile(lp_download_path)
+                            lp_file_exists = graduated.exists(lp_download_path)
                     if lp_file_exists:
                         logger.debug("%s already exists", truncate_middle(lp_download_path, 96))
                 if not lp_file_exists:
