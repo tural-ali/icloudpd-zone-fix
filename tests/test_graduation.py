@@ -34,7 +34,7 @@ LISTING = [
 def write_ledger(folder: str, *lines: str) -> str:
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, graduation.LEDGER_NAME)
-    with open(path, "w", encoding="utf-8") as ledger:
+    with open(path, "w", encoding="utf-8", newline="\n") as ledger:
         ledger.write(graduation.LEDGER_HEADER + "\n")
         for line in lines:
             ledger.write(line + "\n")
@@ -62,6 +62,9 @@ class LedgerParsingTestCase(TestCase):
         for content, why in [
             ("", "incomplete"),
             ("# something else\n", "first line"),
+            # The ledger is LF only; one saved with CRLF is refused, not guessed at.
+            (graduation.LEDGER_HEADER + "\r\n", "first line"),
+            (header + "2018/07/31/IMG_7409.JPG\t1884695\r\n", "not a number"),
             (header + "2018/07/31/IMG_7409.JPG\t1884695", "incomplete"),
             (header + "2018/07/31/IMG_7409.JPG\n", "expected"),
             (header + "2018/07/31/IMG_7409.JPG\tbig\n", "not a number"),
@@ -124,7 +127,7 @@ class GraduationTestCase(TestCase):
         graduated = graduation.Graduation(self.top)
         path = os.path.join(self.day, "IMG_0001.HEIC")
         self.assertFalse(graduated.exists(path))
-        with open(ledger, "a", encoding="utf-8") as f:
+        with open(ledger, "a", encoding="utf-8", newline="\n") as f:
             f.write("2026/09/27/IMG_0001.HEIC\t1200\n")
         self.assertTrue(graduated.exists(path))
 
@@ -267,7 +270,9 @@ class GraduatedDownloadTestCase(TestCase):
 
     def test_a_damaged_ledger_stops_the_run_before_any_download(self) -> None:
         data_dir, cookie_dir = self.folders(inspect.stack()[0][3])
-        with open(os.path.join(data_dir, graduation.LEDGER_NAME), "w", encoding="utf-8") as f:
+        with open(
+            os.path.join(data_dir, graduation.LEDGER_NAME), "w", encoding="utf-8", newline="\n"
+        ) as f:
             f.write(graduation.LEDGER_HEADER + "\n2018/07/31/IMG_7409.JPG\t18846")
         result = self.listing(data_dir, cookie_dir)
         self.assertNotEqual(result.exit_code, 0)
