@@ -242,7 +242,7 @@ class GraduatedDownloadTestCase(TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         # Paths are shortened in the log, so only the names are compared.
         for name in ["IMG_7409-1884695.JPG", "IMG_7409-3294075.MOV"]:
-            self.assertIn(f"/{name} deduplicated", result.output)
+            self.assertIn(f"{os.sep}{name} deduplicated", result.output)
         # Only suffixed names are written. The mocked second download may leave
         # an empty file, but never under a name that graduated.
         files = self.files(data_dir)
