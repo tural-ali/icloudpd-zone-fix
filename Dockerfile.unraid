@@ -5,6 +5,7 @@ USER root
 COPY . /src/icloudpd
 RUN /opt/icloudpd/bin/pip install --no-cache-dir --force-reinstall /src/icloudpd \
     && sh /src/icloudpd/unraid/patch-sync-icloud.sh /usr/local/bin/sync-icloud.sh \
+    && ash /src/icloudpd/unraid/test-resolve-library-list.sh /usr/local/bin/sync-icloud.sh \
     && rm -rf /src/icloudpd
 
 LABEL org.opencontainers.image.source="https://github.com/tural-ali/icloudpd-zone-fix"
