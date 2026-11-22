@@ -28,6 +28,8 @@ case "$SCENARIO:$n" in
   stuck:*)           indexing;;
   recovers:1)        indexing;;
   recovers:2)        printf '2026-11-22 08:00:05 WARNING  All photos and videos that iCloud listed have been downloaded, but the listing may be incomplete\n'; exit 0;;
+  flaky:1|flaky:2)   indexing;;
+  flaky:3)           printf '2026-11-22 08:00:05 WARNING  All photos and videos that iCloud listed have been downloaded, but the listing may be incomplete\n'; exit 0;;
   listing_short:1)   indexing;;
   listing_short:2)   printf '2026-11-22 08:00:05 ERROR    iCloud listed only 10 of 3064 items in the library\n'; exit 1;;
   stderr_only:1)     printf 'Apple iCloud Photo Library has not finished indexing yet\n' >&2; exit 1;;
@@ -78,7 +80,9 @@ run "an argument with spaces survives the retry" recovers 0 2 "--username a --fo
 run "list-libraries is retried too" recovers 0 2 "--username a --list-libraries --ignore-indexing-state" --username a --list-libraries
 expect_out "nothing dropped, nothing claimed" stdout "running again with --ignore-indexing-state"
 if grep -qF "nothing is deleted" "$work/stdout"; then echo "FAIL no 'nothing is deleted' without dropped options"; fails=$((fails + 1)); else echo "ok   no 'nothing is deleted' without dropped options"; fi
-run "still indexing: retried once, then fails" stuck 1 2 "--username a --ignore-indexing-state" --username a --auto-delete
+run "a refused retry is repeated until it gets through" flaky 0 3 "--username a --ignore-indexing-state" --username a --auto-delete
+expect_out "the repeat is announced" stdout "WARNING  iCloud did not answer RUNNING to every indexing check; trying again (2/4)"
+run "still indexing: 4 retries, then fails" stuck 1 5 "--username a --ignore-indexing-state" --username a --auto-delete
 run "a short listing on the retry fails" listing_short 1 2 "--username a --ignore-indexing-state" --username a
 run "already opted in: no retry" stuck 1 1 "" --username a --ignore-indexing-state
 run "auth-only is never wrapped" stuck 1 1 "" --username a --auth-only
