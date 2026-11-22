@@ -8,11 +8,14 @@ resolve_library_list()
    # Here a failed or malformed listing returns no libraries and reports the
    # reason through the files that check_files and the download step already
    # read, so it reaches the log and the failure notification.
+   # icloudpd logs to stdout since 1.34 and defaults to DEBUG, whose
+   # multi-line request dumps would land among the names, so it runs at INFO;
+   # its single-line log lines all start with the date and are dropped.
    local all_libraries resolved_list list_exit_code reason messages
    if [ "${photo_library}" = "all libraries" ]
    then
       log_debug "Fetching libraries list..." >&2
-      run_as "/opt/icloudpd/bin/icloudpd --username ${apple_id} --cookie-directory /config --domain ${auth_domain} --directory /dev/null --list-libraries >/tmp/icloudpd/icloudpd_libraries 2>/tmp/icloudpd/icloudpd_libraries_error; echo \$? >/tmp/icloudpd/icloudpd_libraries_exit_code"
+      run_as "/opt/icloudpd/bin/icloudpd --username ${apple_id} --cookie-directory /config --domain ${auth_domain} --directory /dev/null --log-level info --list-libraries >/tmp/icloudpd/icloudpd_libraries 2>/tmp/icloudpd/icloudpd_libraries_error; echo \$? >/tmp/icloudpd/icloudpd_libraries_exit_code"
       list_exit_code="$(cat /tmp/icloudpd/icloudpd_libraries_exit_code 2>/dev/null)"
       all_libraries="$(sed -e '/^[0-9]/d' -e '/^Libraries:$/d' /tmp/icloudpd/icloudpd_libraries 2>/dev/null)"
       reason=""
