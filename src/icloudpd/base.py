@@ -2,11 +2,13 @@
 """Main script that uses Click to parse command-line arguments"""
 
 import datetime
+import fnmatch
 import getpass
 import itertools
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,10 +25,12 @@ from typing import (
     Iterable,
     List,
     Mapping,
+    NamedTuple,
     Sequence,
     Tuple,
 )
 
+from keyring.errors import KeyringError
 from requests.exceptions import (
     ChunkedEncodingError,
     ContentDecodingError,
@@ -37,7 +41,7 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 from tzlocal import get_localzone
 
-from foundation.core import compose, identity, map_, partial_1_1
+from foundation.core import identity, map_, partial_1_1
 from icloudpd import download, exif_datetime, graduation
 from icloudpd.authentication import authenticator
 from icloudpd.autodelete import autodelete_photos
@@ -49,6 +53,7 @@ from icloudpd.log_level import LogLevel
 from icloudpd.mfa_provider import MFAProvider
 from icloudpd.password_provider import PasswordProvider
 from icloudpd.paths import local_download_path, remove_unicode_chars
+from icloudpd.prune import PruneSnapshot
 from icloudpd.server import serve_app
 from icloudpd.status import Status, StatusExchange
 from icloudpd.string_helpers import parse_timestamp_or_timedelta, truncate_middle
@@ -160,6 +165,59 @@ def update_password_status_in_webui(status_exchange: StatusExchange, _u: str, _p
     status_exchange.replace_status(Status.CHECKING_PASSWORD, Status.NO_INPUT_NEEDED)
 
 
+# Apple's code when it refuses the password (#1348, #1240)
+WRONG_PASSWORD_CODE = "-20101"
+
+
+def apple_service_error(error: PyiCloudFailedLoginException) -> Tuple[str, str] | None:
+    """Apple's own message and code for a refused sign-in, when its answer has them"""
+    cause = next(
+        (arg for arg in error.args[1:] if isinstance(arg, PyiCloudAPIResponseException)), None
+    )
+    if cause is None:
+        return None
+    try:
+        service_error = json.loads(cause.reason)["serviceErrors"][0]
+        message = service_error.get("message")
+        code = service_error.get("code") or cause.code
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return None
+    if not message:
+        return None
+    return str(message), str(code)
+
+
+def apple_sign_in_error(error: PyiCloudFailedLoginException) -> str:
+    """One readable line for a failed sign-in, with Apple's own message when it gave one (#1348)"""
+    message = str(error.args[0]) if error.args else "Sign-in failed"
+    service_error = apple_service_error(error)
+    if service_error is not None:
+        apple_message, apple_code = service_error
+        return f'{message} Apple says: "{apple_message}" ({apple_code})'
+    cause = next(
+        (arg for arg in error.args[1:] if isinstance(arg, PyiCloudAPIResponseException)), None
+    )
+    if cause is None:
+        return message
+    return f"{message} Apple's answer: {cause}"
+
+
+def log_sign_in_hints(
+    logger: logging.Logger, user_config: UserConfig, error: PyiCloudFailedLoginException
+) -> None:
+    """What to try after Apple refused the password"""
+    if error.password_provider == PasswordProvider.KEYRING.value:
+        logger.info(
+            "The password came from the keyring and may be out of date; remove it with "
+            "`icloud --username %s --delete-from-keyring` and run icloudpd again to enter it",
+            user_config.username,
+        )
+    logger.info(
+        "If the password is right, deleting the saved session in %s and signing in again can help",
+        os.path.expanduser(user_config.cookie_directory),
+    )
+
+
 def update_auth_error_in_webui(status_exchange: StatusExchange, error: str) -> bool:
     return status_exchange.set_error(error)
 
@@ -173,6 +231,18 @@ def update_auth_error_in_webui(status_exchange: StatusExchange, error: str) -> b
 
 def dummy_password_writter(_u: str, _p: str) -> None:
     pass
+
+
+def keyring_password_reader(logger: Logger) -> Callable[[str], str | None]:
+    def _intern(username: str) -> str | None:
+        try:
+            return get_password_from_keyring(username)
+        except KeyringError as e:
+            # e.g. a locked or missing keyring on a headless machine: try the next provider
+            logger.warning(f"Could not read password from keyring: {type(e).__name__}: {e}")
+            return None
+
+    return _intern
 
 
 def keyring_password_writter(logger: Logger) -> Callable[[str, str], None]:
@@ -201,7 +271,8 @@ def skip_created_generator(
 
 def ensure_tzinfo(tz: datetime.tzinfo, input: datetime.datetime) -> datetime.datetime:
     if input.tzinfo is None:
-        return input.astimezone(tz)
+        # attach tz; astimezone() would read the naive time in the system time zone instead
+        return input.replace(tzinfo=tz)
     return input
 
 
@@ -215,21 +286,38 @@ def create_logger(config: GlobalConfig) -> logging.Logger:
         stream=sys.stdout,
     )
     logger = logging.getLogger("icloudpd")
+    library_logger = logging.getLogger("pyicloud_ipd")
     if config.only_print_filenames:
         logger.disabled = True
+        # stdout is the list of filenames: only the library's warnings and errors, as before
+        # (set explicitly, because the logger instances are shared between tests)
+        library_logger.setLevel(logging.WARNING)
+        logging.getLogger("pyicloud_ipd.http").setLevel(logging.NOTSET)
+        logging.getLogger("pyicloud_ipd.session").setLevel(logging.NOTSET)
     else:
         # Need to make sure disabled is reset to the correct value,
         # because the logger instance is shared between tests.
         logger.disabled = False
         if config.log_level == LogLevel.DEBUG:
-            logger.setLevel(logging.DEBUG)
+            level = logging.DEBUG
         elif config.log_level == LogLevel.INFO:
-            logger.setLevel(logging.INFO)
+            level = logging.INFO
         elif config.log_level == LogLevel.ERROR:
-            logger.setLevel(logging.ERROR)
+            level = logging.ERROR
         else:
             # Developer's error - not an exhaustive match
             raise ValueError(f"Unsupported logging level {config.log_level}")
+        logger.setLevel(level)
+        # The iCloud library logs under its own name; without a level it stays at WARNING and
+        # its debug lines (e.g. the indexing state retries) never show (#1488)
+        library_logger.setLevel(level)
+        # Per request it logs the request, the response headers and body (session tokens) and
+        # that it saved the session: keep that out of the output, also at the default debug level.
+        # This holds the whole pyicloud_ipd.session logger at INFO on purpose: its only debug
+        # lines are the two per-request "saved" lines
+        quiet = max(level, logging.INFO)
+        logging.getLogger("pyicloud_ipd.http").setLevel(quiet)
+        logging.getLogger("pyicloud_ipd.session").setLevel(quiet)
     return logger
 
 
@@ -250,8 +338,16 @@ def run_with_configs(global_config: GlobalConfig, user_configs: Sequence[UserCon
     # Start web server ONCE if needed, outside all loops
     if needs_web_server:
         logger.info("Starting web server for WebUI authentication...")
-        server_thread = Thread(target=serve_app, daemon=True, args=[logger, shared_status_exchange])
+        server_thread = Thread(
+            target=serve_app,
+            daemon=True,
+            args=[logger, shared_status_exchange, global_config.webui_host],
+        )
         server_thread.start()
+
+    for user_config in user_configs:
+        for warning in keep_icloud_recent_days_warnings(user_config):
+            logger.warning(warning)
 
     # Check if we're in watch mode
     watch_interval = global_config.watch_with_interval
@@ -344,7 +440,7 @@ def _process_all_users_once(
                     )
                 elif provider == PasswordProvider.KEYRING:
                     password_providers_dict[provider] = (
-                        get_password_from_keyring,
+                        keyring_password_reader(logger),
                         keyring_password_writter(logger),
                     )
                 elif provider == PasswordProvider.PARAMETER:
@@ -394,6 +490,8 @@ def _process_all_users_once(
                 user_config.skip_created_after,
                 user_config.skip_photos,
                 filename_builder,
+                skip_screenshots=user_config.skip_screenshots,
+                exclude_filenames=user_config.exclude_filenames,
             )
 
             downloader = (
@@ -414,9 +512,12 @@ def _process_all_users_once(
                     lp_filename_generator,
                     filename_builder,
                     user_config.align_raw,
+                    temp_suffix=user_config.temp_suffix,
+                    xmp_sidecar_only=user_config.xmp_sidecar_only,
+                    live_photo_directory=user_config.live_photo_directory,
                 )
                 if user_config.directory is not None
-                else (lambda _s, _c, _p: False)
+                else (lambda _s, _c, _p: NOT_DOWNLOADED)
             )
 
             notificator = partial(
@@ -458,6 +559,29 @@ def _process_all_users_once(
                     )
 
     return 0
+
+
+def keep_icloud_recent_days_warnings(user_config: UserConfig) -> List[str]:
+    """Options that leave assets in iCloud that --keep-icloud-recent-days would otherwise delete"""
+    if user_config.keep_icloud_recent_days is None:
+        return []
+    warnings = []
+    if user_config.recent is not None:
+        warnings.append(
+            f"--keep-icloud-recent-days is used with --recent {user_config.recent}: "
+            f"only the first {user_config.recent} assets are checked, older assets are not deleted from iCloud"
+        )
+    if user_config.until_found is not None:
+        warnings.append(
+            f"--keep-icloud-recent-days is used with --until-found {user_config.until_found}: "
+            "assets after the point where the run stops are not deleted from iCloud"
+        )
+    if user_config.skip_live_photos:
+        warnings.append(
+            "--keep-icloud-recent-days is used with --skip-live-photos: Live Photos are not "
+            "deleted from iCloud, since their video is not downloaded"
+        )
+    return warnings
 
 
 def notificator_builder(
@@ -512,6 +636,13 @@ def _(offset: datetime.timedelta) -> datetime.datetime:
     return datetime.datetime.now(get_localzone()) - offset
 
 
+def matches_exclude_filename(filename: str, patterns: Sequence[str]) -> bool:
+    """Whether the filename matches one of the --exclude-filename patterns, ignoring case"""
+    return any(
+        re.match(fnmatch.translate(pattern), filename, flags=re.IGNORECASE) for pattern in patterns
+    )
+
+
 def where_builder(
     logger: logging.Logger,
     skip_videos: bool,
@@ -520,12 +651,19 @@ def where_builder(
     skip_photos: bool,
     filename_builder: Callable[[PhotoAsset], str],
     photo: PhotoAsset,
+    *,
+    skip_screenshots: bool = False,
+    exclude_filenames: Sequence[str] = (),
 ) -> bool:
     if skip_videos and photo.item_type == AssetItemType.MOVIE:
         logger.debug(asset_type_skip_message(AssetItemType.IMAGE, filename_builder, photo))
         return False
     if skip_photos and photo.item_type == AssetItemType.IMAGE:
         logger.debug(asset_type_skip_message(AssetItemType.MOVIE, filename_builder, photo))
+        return False
+
+    if skip_screenshots and photo.is_screenshot:
+        logger.debug(f"Skipping {filename_builder(photo)}, as it is a screenshot.")
         return False
 
     if skip_created_before is not None:
@@ -538,6 +676,12 @@ def where_builder(
         temp_created_after = offset_to_datetime(skip_created_after)
         if photo.created > temp_created_after:
             logger.debug(skip_created_after_message(temp_created_after, photo, filename_builder))
+            return False
+
+    if exclude_filenames:
+        filename = filename_builder(photo)
+        if matches_exclude_filename(filename, exclude_filenames):
+            logger.debug(f"Skipping {filename}, as it matches --exclude-filename.")
             return False
 
     return True
@@ -561,6 +705,18 @@ def skip_created_after_message(
     return f"Skipping {filename}, as it was created {photo.created}, after {target_created_date}."
 
 
+class DownloadResult(NamedTuple):
+    downloaded: bool
+    """a file was downloaded in this run (what --delete-after-download acts on)"""
+    present: bool
+    """every requested file is on disk now, downloaded earlier or in this run"""
+    created_paths: tuple[str, ...] = ()
+    expected_paths: tuple[str, ...] = ()
+
+
+NOT_DOWNLOADED = DownloadResult(downloaded=False, present=False)
+
+
 def download_builder(
     logger: logging.Logger,
     folder_structure: str,
@@ -580,8 +736,13 @@ def download_builder(
     icloud: PyiCloudService,
     counter: Counter,
     photo: PhotoAsset,
-) -> bool:
-    """function for actually downloading the photos"""
+    *,
+    inspect_only: bool = False,
+    temp_suffix: str = ".part",
+    xmp_sidecar_only: bool = False,
+    live_photo_directory: str | None = None,
+) -> DownloadResult:
+    """Download files, or inspect their selected paths without writing or fetching media."""
 
     try:
         created_date = photo.created.astimezone(get_localzone())
@@ -610,9 +771,15 @@ def download_builder(
 
     try:
         versions, filename_overrides = disambiguate_filenames(
-            photo.versions_with_raw_policy(raw_policy), primary_sizes, photo, lp_filename_generator
+            photo.versions_with_raw_policy(raw_policy),
+            primary_sizes,
+            photo,
+            lp_filename_generator,
+            filename_builder(photo),
         )
     except KeyError as ex:
+        if inspect_only:
+            raise ValueError("Cannot determine existing mirror filenames") from ex
         print(f"KeyError: {ex} attribute was not found in the photo fields.")
         with open(file="icloudpd-photo-error.json", mode="w", encoding="utf8") as outfile:
             json.dump(
@@ -629,10 +796,18 @@ def download_builder(
             "https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues"
         )
         print("Include a link to the Gist in your issue, so that we can see what went wrong.\n")
-        return False
+        return NOT_DOWNLOADED
 
     download_dir = os.path.normpath(os.path.join(directory, date_path))
     success = False
+    created_paths: list[str] = []
+    expected_paths: list[str] = []
+    # nothing is written in --only-print-filenames mode
+    present = not only_print_filenames and not inspect_only
+    # --until-found counts photos, not files: with several sizes, a photo counts once when
+    # all its files are already there
+    found_existing = False
+    found_missing = False
 
     for download_size in primary_sizes:
         if download_size not in versions and download_size != AssetVersionSize.ORIGINAL:
@@ -643,10 +818,23 @@ def download_builder(
                     download_size.value,
                     error_filename,
                 )
+                # a requested size is not kept locally
+                present = False
                 continue
             if AssetVersionSize.ORIGINAL in primary_sizes:
                 continue  # that should avoid double download for original
             download_size = AssetVersionSize.ORIGINAL
+
+        if download_size not in versions:
+            # iCloud lists some assets without an original (e.g. damaged or never fully
+            # uploaded); skip them instead of stopping the whole run with a KeyError
+            logger.error(
+                "%s size does not exist for %s. Skipping...",
+                download_size.value,
+                filename_builder(photo),
+            )
+            present = False
+            continue
 
         version = versions[download_size]
         photo_filename = filename_builder(photo)
@@ -661,6 +849,13 @@ def download_builder(
 
         download_path = local_download_path(filename, download_dir)
 
+        if inspect_only:
+            expected_paths.append(download_path)
+            if download_size == AssetVersionSize.ORIGINAL:
+                expected_paths.append(add_suffix_to_filename("-original", download_path))
+            if file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX:
+                expected_paths.append((f"-{version.size}.").join(download_path.rsplit(".", 1)))
+
         # A file moved out on purpose still counts as downloaded; see graduation.py.
         graduated = graduation.for_directory(directory)
         original_download_path = None
@@ -673,21 +868,44 @@ def download_builder(
             file_exists = graduated.exists(original_download_path)
 
         if file_exists:
-            if file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX:
+            # With --xmp-sidecar-only nothing is downloaded, so a local copy of a different
+            # size (an export, say) must keep the plain name and get the sidecar
+            if (
+                file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX
+                and not xmp_sidecar_only
+            ):
                 # for later: this crashes if download-size medium is specified
                 file_size = graduated.size(original_download_path or download_path)
                 photo_size = version.size
-                if file_size != photo_size:
+                if file_size != photo_size and not (
+                    set_exif_datetime
+                    and exif_datetime.has_own_exif_date(
+                        logger,
+                        original_download_path or download_path,
+                        created_date.strftime("%Y:%m:%d %H:%M:%S"),
+                        file_size,
+                        photo_size,
+                    )
+                ):
                     download_path = (f"-{photo_size}.").join(download_path.rsplit(".", 1))
+                    original_download_path = None
                     logger.debug("%s deduplicated", truncate_middle(download_path, 96))
                     file_exists = graduated.exists(download_path)
             if file_exists:
-                counter.increment()
+                found_existing = True
                 logger.debug("%s already exists", truncate_middle(download_path, 96))
 
-        if not file_exists:
+        expected_paths.append(
+            original_download_path if file_exists and original_download_path else download_path
+        )
+
+        if not file_exists and not inspect_only:
+            found_missing = True
             counter.reset()
-            if only_print_filenames:
+            if xmp_sidecar_only:
+                # only the sidecar is written; without the media file the asset is not kept locally
+                present = False
+            elif only_print_filenames:
                 print(download_path)
             else:
                 truncated_path = truncate_middle(download_path, 96)
@@ -702,8 +920,10 @@ def download_builder(
                     version,
                     download_size,
                     filename_builder,
+                    temp_suffix,
                 )
                 success = download_result
+                present = present and download_result
 
                 if download_result:
                     from foundation.core import compose
@@ -728,12 +948,26 @@ def download_builder(
                     if not dry_run:
                         download.set_utime(download_path, created_date)
                     logger.info("Downloaded %s", truncated_path)
+                    if not dry_run:
+                        created_paths.append(download_path)
 
-        if xmp_sidecar:
-            generate_xmp_file(logger, download_path, photo._asset_record, dry_run)
+        if xmp_sidecar and not only_print_filenames:
+            expected_paths.append(download_path + ".xmp")
+            if not inspect_only:
+                if xmp_sidecar_only and not dry_run:
+                    os.makedirs(download_dir, exist_ok=True)
+                sidecar_existed = os.path.lexists(download_path + ".xmp")
+                generate_xmp_file(
+                    logger, download_path, photo._asset_record, dry_run, download_size
+                )
+                if not dry_run and not sidecar_existed and os.path.isfile(download_path + ".xmp"):
+                    created_paths.append(download_path + ".xmp")
+
+    if found_existing and not found_missing:
+        counter.increment()
 
     # Also download the live photo if present
-    if not skip_live_photos:
+    if not skip_live_photos and not xmp_sidecar_only:
         lp_size = live_photo_size
         photo_versions_with_policy = photo.versions_with_raw_policy(raw_policy)
         if lp_size in photo_versions_with_policy:
@@ -754,7 +988,20 @@ def download_builder(
                 )
             else:
                 pass
-            lp_download_path = os.path.join(download_dir, lp_filename)
+            # --live-photo-directory keeps the videos apart, with the same folder structure (#94)
+            lp_download_dir = (
+                os.path.normpath(os.path.join(live_photo_directory, date_path))
+                if live_photo_directory
+                else download_dir
+            )
+            lp_download_path = os.path.join(lp_download_dir, lp_filename)
+
+            if inspect_only:
+                expected_paths.append(lp_download_path)
+                if file_match_policy == FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX:
+                    expected_paths.append(
+                        (f"-{version.size}.").join(lp_download_path.rsplit(".", 1))
+                    )
 
             graduated = graduation.for_directory(directory)
             lp_file_exists = graduated.exists(lp_download_path)
@@ -789,7 +1036,7 @@ def download_builder(
                             lp_file_exists = graduated.exists(lp_download_path)
                     if lp_file_exists:
                         logger.debug("%s already exists", truncate_middle(lp_download_path, 96))
-                if not lp_file_exists:
+                if not lp_file_exists and not inspect_only:
                     truncated_path = truncate_middle(lp_download_path, 96)
                     logger.debug("Downloading %s...", truncated_path)
                     download_result = download.download_media(
@@ -801,11 +1048,24 @@ def download_builder(
                         version,
                         lp_size,
                         filename_builder,
+                        temp_suffix,
                     )
                     success = download_result and success
+                    present = present and download_result
                     if download_result:
                         logger.info("Downloaded %s", truncated_path)
-    return success
+                        if not dry_run:
+                            created_paths.append(lp_download_path)
+                expected_paths.append(lp_download_path)
+        elif any(isinstance(size, LivePhotoVersionSize) for size in photo_versions_with_policy):
+            # a live photo without the requested video size: the video is not kept locally
+            present = False
+    return DownloadResult(
+        downloaded=success,
+        present=present,
+        created_paths=tuple(created_paths),
+        expected_paths=tuple(dict.fromkeys(expected_paths)),
+    )
 
 
 def delete_photo(
@@ -813,8 +1073,8 @@ def delete_photo(
     library_object: PhotoLibrary,
     photo: PhotoAsset,
     filename_builder: Callable[[PhotoAsset], str],
-) -> None:
-    """Delete a photo from the iCloud account."""
+) -> bool:
+    """Delete a photo from the iCloud account. Returns False if iCloud asked to try again later."""
     clean_filename_local = filename_builder(photo)
     logger.debug("Deleting %s in iCloud...", clean_filename_local)
     url = (
@@ -839,8 +1099,19 @@ def delete_photo(
             "zoneID": library_object.zone_id,
         }
     )
-    library_object.session.post(url, data=post_data, headers={"Content-type": "application/json"})
+    try:
+        library_object.session.post(
+            url, data=post_data, headers={"Content-type": "application/json"}
+        )
+    except PyiCloudAPIResponseException as error:
+        # e.g. "Sync zone CAS Op-Lock failed" when another change to the library happened at
+        # the same time (#1283); the photo stays in iCloud and the run goes on
+        if error.code != "TRY_AGAIN_LATER":
+            raise
+        logger.error("Could not delete %s in iCloud: %s", clean_filename_local, error)
+        return False
     logger.info("Deleted %s in iCloud", clean_filename_local)
+    return True
 
 
 def delete_photo_dry_run(
@@ -848,7 +1119,7 @@ def delete_photo_dry_run(
     library_object: PhotoLibrary,
     photo: PhotoAsset,
     filename_builder: Callable[[PhotoAsset], str],
-) -> None:
+) -> bool:
     """Dry run for deleting a photo from the iCloud"""
     filename = filename_builder(photo)
     logger.info(
@@ -856,6 +1127,7 @@ def delete_photo_dry_run(
         filename,
         library_object.zone_id["zoneName"],
     )
+    return True
 
 
 def dump_responses(dumper: Callable[[Any], None], responses: List[Mapping[str, Any]]) -> None:
@@ -884,7 +1156,7 @@ def core_single_run(
         PasswordProvider, Tuple[Callable[[str], str | None], Callable[[str, str], None]]
     ],
     passer: Callable[[PhotoAsset], bool],
-    downloader: Callable[[PyiCloudService, Counter, PhotoAsset], bool],
+    downloader: Callable[[PyiCloudService, Counter, PhotoAsset], DownloadResult],
     notificator: Callable[[], None],
     lp_filename_generator: Callable[[str], str],
 ) -> int:
@@ -895,7 +1167,9 @@ def core_single_run(
         or global_config.no_progress_bar
         or not sys.stdout.isatty()
     )
+    listing_incomplete = False
     while True:  # retry loop (not watch - only for immediate retries)
+        prune_snapshot: PruneSnapshot | None = None
         captured_responses: List[Mapping[str, Any]] = []
 
         def append_response(captured: List[Mapping[str, Any]], response: Mapping[str, Any]) -> None:
@@ -916,6 +1190,8 @@ def core_single_run(
                 partial(append_response, captured_responses),
                 user_config.cookie_directory,
                 os.environ.get("CLIENT_ID"),
+                user_config.adp_web_access,
+                user_config.ignore_indexing_state,
             )
 
             # dump captured responses for debugging
@@ -942,11 +1218,9 @@ def core_single_run(
                         library_object: PhotoLibrary = icloud.photos.private_libraries[
                             user_config.library
                         ]
-                    elif user_config.library == "PrimarySync" and icloud.photos.zone_id.get(
-                        "zoneName", ""
-                    ).startswith("PrimarySync"):
-                        # Preserve the historical CLI default for accounts whose
-                        # primary zone has been migrated to names such as PrimarySync1.
+                    elif user_config.library == "PrimarySync":
+                        # the default: on accounts whose library moved to another zone, such as
+                        # PrimarySync1 (#1361), the primary library is that zone
                         library_object = icloud.photos
                     elif user_config.library in icloud.photos.shared_libraries:
                         library_object = icloud.photos.shared_libraries[user_config.library]
@@ -969,6 +1243,49 @@ def core_single_run(
                         pass
 
                     directory = os.path.normpath(user_config.directory)
+
+                    if user_config.prune_orphans:
+                        if library_object.library_type != "shared":
+                            logger.warning(
+                                "Skipping orphan pruning: only supported for shared libraries"
+                            )
+                        else:
+                            try:
+                                scope = json.dumps(
+                                    {
+                                        "account": user_config.username.casefold(),
+                                        "domain": global_config.domain,
+                                        "zone": library_object.zone_id,
+                                        "timezone": str(get_localzone()),
+                                        "settings": {
+                                            name: str(getattr(user_config, name))
+                                            for name in (
+                                                "sizes",
+                                                "force_size",
+                                                "folder_structure",
+                                                "xmp_sidecar",
+                                                "skip_live_photos",
+                                                "live_photo_size",
+                                                "live_photo_mov_filename_policy",
+                                                "align_raw",
+                                                "file_match_policy",
+                                                "keep_unicode_in_filenames",
+                                                "set_exif_datetime",
+                                            )
+                                        },
+                                    },
+                                    sort_keys=True,
+                                )
+                                prune_snapshot = PruneSnapshot(
+                                    directory,
+                                    scope,
+                                    user_config.dry_run,
+                                    temp_suffix=user_config.temp_suffix,
+                                )
+                            except Exception as error:
+                                logger.warning("Skipping orphan pruning: %s", error)
+                                logger.debug("Orphan-pruning setup failed", exc_info=True)
+                    prune_complete = True
 
                     if user_config.skip_photos or user_config.skip_videos:
                         photo_video_phrase = "photos" if user_config.skip_videos else "videos"
@@ -995,8 +1312,9 @@ def core_single_run(
                     def sum_(inp: Iterable[int]) -> int:
                         return sum(inp)
 
-                    photos_count: int | None = compose(sum_, album_lengths)(albums)
-                    for photo_album in albums:
+                    album_sizes = list(album_lengths(albums))
+                    photos_count: int | None = sum_(album_sizes)
+                    for photo_album, album_size in zip(albums, album_sizes, strict=True):
                         photos_enumerator: Iterable[PhotoAsset] = photo_album
 
                         # Optional: Only download the x most recent photos.
@@ -1090,13 +1408,42 @@ def core_single_run(
                                 should_delete = False
 
                                 passer_result = passer(item)
-                                download_result = passer_result and download_photo(
-                                    consecutive_files_found, item
+                                download_result = (
+                                    download_photo(consecutive_files_found, item)
+                                    if passer_result
+                                    else NOT_DOWNLOADED
                                 )
-                                if download_result and user_config.delete_after_download:
+                                if prune_snapshot is not None and prune_complete:
+                                    if passer_result and not download_result.present:
+                                        prune_complete = False
+                                    try:
+                                        prune_snapshot.record(
+                                            item.id, download_result.created_paths
+                                        )
+                                    except Exception as error:
+                                        logger.warning("Skipping orphan pruning: %s", error)
+                                        logger.debug("Orphan tracking failed", exc_info=True)
+                                        prune_complete = False
+                                if download_result.downloaded and user_config.delete_after_download:
                                     should_delete = True
 
                                 if (
+                                    passer_result
+                                    and user_config.keep_icloud_recent_days is not None
+                                    and not item.has_asset_date
+                                ):
+                                    # the age can't be known; asset_date fell back to 1970
+                                    logger.warning(
+                                        "Not deleting %s from iCloud: it has no creation date",
+                                        build_filename_with_policies(
+                                            user_config.file_match_policy,
+                                            build_filename_cleaner(
+                                                user_config.keep_unicode_in_filenames
+                                            ),
+                                            item,
+                                        ),
+                                    )
+                                elif (
                                     passer_result
                                     and user_config.keep_icloud_recent_days is not None
                                 ):
@@ -1122,8 +1469,35 @@ def core_single_run(
                                             debug_filename,
                                             age_days,
                                         )
-                                    else:
+                                    elif user_config.skip_live_photos and any(
+                                        isinstance(size, LivePhotoVersionSize)
+                                        for size in item.versions
+                                    ):
+                                        # its video was not downloaded, so deleting the asset
+                                        # would lose the video
+                                        logger.debug(
+                                            "Not deleting %s from iCloud: it is a Live Photo and --skip-live-photos did not download its video",
+                                            build_filename_with_policies(
+                                                user_config.file_match_policy,
+                                                build_filename_cleaner(
+                                                    user_config.keep_unicode_in_filenames
+                                                ),
+                                                item,
+                                            ),
+                                        )
+                                    elif download_result.present:
                                         should_delete = True
+                                    elif not global_config.only_print_filenames:
+                                        logger.warning(
+                                            "Not deleting %s from iCloud: it is not present locally",
+                                            build_filename_with_policies(
+                                                user_config.file_match_policy,
+                                                build_filename_cleaner(
+                                                    user_config.keep_unicode_in_filenames
+                                                ),
+                                                item,
+                                            ),
+                                        )
 
                                 if should_delete:
                                     # Create filename cleaner and builder for delete operations
@@ -1134,14 +1508,14 @@ def core_single_run(
                                         user_config.file_match_policy, filename_cleaner_for_delete
                                     )
                                     if user_config.dry_run:
-                                        delete_photo_dry_run(
+                                        deleted = delete_photo_dry_run(
                                             logger,
                                             library_object,
                                             item,
                                             filename_builder_for_delete,
                                         )
                                     else:
-                                        delete_photo(
+                                        deleted = delete_photo(
                                             logger,
                                             library_object,
                                             item,
@@ -1149,7 +1523,9 @@ def core_single_run(
                                         )
 
                                     # retrier(delete_local, error_handler)
-                                    photo_album.increment_offset(-1)
+                                    # a dry run deletes nothing, so the next page still starts after this asset
+                                    if deleted and not user_config.dry_run:
+                                        photo_album.increment_offset(-1)
 
                                 photos_counter += 1
                                 status_exchange.get_progress().photos_counter = photos_counter
@@ -1161,15 +1537,35 @@ def core_single_run(
                                 break
 
                         if global_config.only_print_filenames:
-                            return 0
+                            # go on with the next album; nothing is deleted below
+                            status_exchange.get_progress().reset()
+                            continue
                         else:
                             pass
 
+                        # iCloud said beforehand how many assets the album holds. The listing
+                        # stops at the first empty page, so an empty page halfway would otherwise
+                        # end the run as if everything was downloaded (#1390)
+                        listed_everything = (
+                            user_config.recent is None and user_config.until_found is None
+                        )
                         if status_exchange.get_progress().cancel:
+                            prune_complete = False
                             logger.info("Iteration was cancelled")
                             status_exchange.get_progress().photos_last_message = (
                                 "Iteration was cancelled"
                             )
+                        elif listed_everything and photos_counter < album_size:
+                            prune_complete = False
+                            listing_incomplete = True
+                            where = f"album {photo_album}" if str(photo_album) else "the library"
+                            message = (
+                                f"iCloud listed only {photos_counter} of {album_size} items in "
+                                f"{where}; the listing ended early, so not everything was "
+                                "downloaded. Run icloudpd again to download the rest"
+                            )
+                            logger.error(message)
+                            status_exchange.get_progress().photos_last_message = message
                         else:
                             if user_config.skip_photos or user_config.skip_videos:
                                 photo_video_phrase = (
@@ -1177,12 +1573,79 @@ def core_single_run(
                                 )
                             else:
                                 photo_video_phrase = "photos and videos"
-                            message = f"All {photo_video_phrase} have been downloaded"
-                            logger.info(message)
+                            if (
+                                user_config.ignore_indexing_state
+                                and library_object.indexing_state_ignored
+                            ):
+                                # the warning at the start is easy to miss in an unattended
+                                # run; the last line must not claim a complete download (#1387)
+                                message = (
+                                    f"All {photo_video_phrase} that iCloud listed have been "
+                                    "downloaded, but the listing may be incomplete: iCloud still "
+                                    "reported the library as indexing and --ignore-indexing-state "
+                                    "was used. A later run without the option picks up what is "
+                                    "missing"
+                                )
+                                logger.warning(message)
+                            else:
+                                message = f"All {photo_video_phrase} have been downloaded"
+                                logger.info(message)
                             status_exchange.get_progress().photos_last_message = message
                         status_exchange.get_progress().reset()
 
-                    if user_config.auto_delete:
+                    if prune_snapshot is not None:
+                        if prune_complete:
+                            try:
+
+                                def inspect_existing(
+                                    item: PhotoAsset,
+                                    *,
+                                    destination: str = directory,
+                                    service: PyiCloudService = icloud,
+                                ) -> tuple[str, ...]:
+                                    return download_builder(
+                                        logger=logger,
+                                        folder_structure=user_config.folder_structure,
+                                        directory=destination,
+                                        primary_sizes=user_config.sizes,
+                                        force_size=user_config.force_size,
+                                        only_print_filenames=False,
+                                        set_exif_datetime=user_config.set_exif_datetime,
+                                        skip_live_photos=user_config.skip_live_photos,
+                                        live_photo_size=user_config.live_photo_size,
+                                        dry_run=True,
+                                        file_match_policy=user_config.file_match_policy,
+                                        xmp_sidecar=user_config.xmp_sidecar,
+                                        lp_filename_generator=lp_filename_generator,
+                                        filename_builder=create_filename_builder(
+                                            user_config.file_match_policy,
+                                            build_filename_cleaner(
+                                                user_config.keep_unicode_in_filenames
+                                            ),
+                                        ),
+                                        raw_policy=user_config.align_raw,
+                                        icloud=service,
+                                        counter=Counter(),
+                                        photo=item,
+                                        inspect_only=True,
+                                    ).expected_paths
+
+                                prune_snapshot.finish(
+                                    logger,
+                                    library_object,
+                                    user_config.dry_run,
+                                    lambda: status_exchange.get_progress().cancel,
+                                    inspect_existing
+                                    if user_config.prune_orphans_adopt_existing
+                                    else None,
+                                )
+                            except Exception as error:
+                                logger.warning("Skipping orphan pruning: %s", error)
+                                logger.debug("Orphan-pruning finalization failed", exc_info=True)
+                        else:
+                            logger.warning("Skipping orphan pruning: download run did not complete")
+
+                    if user_config.auto_delete and not global_config.only_print_filenames:
                         autodelete_photos(
                             logger,
                             user_config.dry_run,
@@ -1192,14 +1655,25 @@ def core_single_run(
                             user_config.sizes,
                             lp_filename_generator,
                             user_config.align_raw,
+                            create_filename_builder(
+                                user_config.file_match_policy,
+                                build_filename_cleaner(user_config.keep_unicode_in_filenames),
+                            ),
+                            live_photo_directory=user_config.live_photo_directory,
                         )
                     else:
                         pass
         except PyiCloudFailedLoginException as error:
-            logger.info(error)
+            sign_in_error = apple_sign_in_error(error)
+            logger.error(sign_in_error)
+            service_error = apple_service_error(error)
+            if service_error is not None and service_error[1] == WRONG_PASSWORD_CODE:
+                log_sign_in_hints(logger, user_config, error)
+            if captured_responses:
+                logger.debug("Sign-in requests and responses (for a bug report):")
             dump_responses(logger.debug, captured_responses)
             if PasswordProvider.WEBUI in global_config.password_providers:
-                update_auth_error_in_webui(status_exchange, str(error))
+                update_auth_error_in_webui(status_exchange, sign_in_error)
                 continue
             else:
                 return 1
@@ -1246,8 +1720,14 @@ def core_single_run(
         except Exception:
             dump_responses(logger.debug, captured_responses)
             raise
+        finally:
+            if prune_snapshot is not None:
+                try:
+                    prune_snapshot.close()
+                except OSError as error:
+                    logger.warning("Cannot close orphan-pruning lock: %s", error)
 
         # In single run mode, we don't handle watch intervals - that's done at higher level
         break
 
-    return 0
+    return 1 if listing_incomplete else 0

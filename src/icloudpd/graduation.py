@@ -220,7 +220,7 @@ class Graduation:
                 "[DRY RUN] Would note the archived copy of %s as deleted on the phone", path
             )
             return True
-        if ledger.report_deletion(relative, size, datetime.datetime.now(datetime.timezone.utc)):
+        if ledger.report_deletion(relative, size, datetime.datetime.now(datetime.UTC)):
             logger.info("Noted the archived copy of %s as deleted on the phone", path)
         return True
 

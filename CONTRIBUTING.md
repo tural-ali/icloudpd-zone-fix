@@ -143,7 +143,7 @@ Note: that the step expects executables to be already prepared by previous steps
 Building NPM packages (with single executables; platform-specific):
 
 ``` sh
-scripts/build_npm 1.32.3
+scripts/build_npm 1.34.0
 ```
 Note: that the step expects executables to be already prepared by previous steps
 
@@ -202,9 +202,9 @@ When testing a bug fix it is important to test the faulty behavior and also the 
 
 ## How to release
 
-We have GitHub actions taking care for building, testing, and releasing software. Building and testing are happening automatically on git pushed, pull requests, and merges. For releases the following steps are manual:
+We have GitHub actions taking care for building, testing, and releasing software (see [.github/workflows/README.md](.github/workflows/README.md) for how they are set up). Building and testing are happening automatically on git pushed, pull requests, and merges. For releases the following steps are manual:
 - Bump version in all files, including all source files
 - Update CHANGELOG.md with release changes if they were not added with commits
 - Update CHANGELOG.md with date of the release
 - Commit & push changes (either directly or through pull requests)
-- Add version tag to head (`git tag v1.32.2`) and push it to master (`git push origin v1.32.2`) -- there seems to be no way to do that in UI
+- Add version tag to head (`git tag v1.32.2`) and push it to master (`git push origin v1.32.2`); the release workflow then builds everything and creates the GitHub release with all files and the release notes compiled from CHANGELOG.md and the compatibility reports, so there is no need to create the release in the GitHub UI. If a release for the tag was created in the UI anyway, the workflow updates it: its title becomes the tag, its text is replaced by the compiled notes, and it is no longer marked as a pre-release

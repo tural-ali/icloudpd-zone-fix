@@ -9,11 +9,22 @@ import getpass
 import sys
 from typing import NoReturn, Sequence
 
+from keyring.errors import KeyringError
+
 from foundation import version_info_formatted
 from pyicloud_ipd.base import PyiCloudService
 from pyicloud_ipd.exceptions import PyiCloudFailedLoginException
 
 from . import utils
+
+
+def read_password_from_keyring(username: str) -> str | None:
+    try:
+        return utils.get_password_from_keyring(username)
+    except KeyringError as e:
+        # e.g. a locked or missing keyring on a headless machine: ask for the password instead
+        print(f"Could not read password from keyring: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
 
 
 def main(args: Sequence[str] | None = None) -> NoReturn:
@@ -97,7 +108,7 @@ def main(args: Sequence[str] | None = None) -> NoReturn:
         got_from_keyring = False
 
         if password is None:
-            password = utils.get_password_from_keyring(username)
+            password = read_password_from_keyring(username)
             got_from_keyring = password is not None
 
         if password is None:
@@ -128,6 +139,13 @@ def main(args: Sequence[str] | None = None) -> NoReturn:
                     utils.store_password_in_keyring(username, password)
 
             if api.requires_2fa:
+                # Apple only sends the code to trusted devices once this push is triggered (see icloudpd's request_2fa)
+                if not api.trigger_push_notification():
+                    print(
+                        "Failed to trigger 2FA push notification, continuing anyway",
+                        file=sys.stderr,
+                    )
+
                 # fmt: off
                 print(
                     "\nTwo-step authentication required.",
@@ -177,8 +195,11 @@ def main(args: Sequence[str] | None = None) -> NoReturn:
         except PyiCloudFailedLoginException as err:
             # If they have a stored password; we just used it and
             # it did not work; let's delete it if there is one.
-            if utils.password_exists_in_keyring(username):
-                utils.delete_password_in_keyring(username)
+            try:
+                if utils.password_exists_in_keyring(username):
+                    utils.delete_password_in_keyring(username)
+            except KeyringError:
+                pass
 
             message = f"Bad username or password for {username}"
             password = None

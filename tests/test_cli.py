@@ -1,13 +1,15 @@
 import datetime
 import inspect
+import locale
 import os
+import runpy
 import shutil
-import zoneinfo
 from argparse import ArgumentError
 from typing import Sequence, Tuple
-from unittest import TestCase
+from unittest import TestCase, mock
 
 import pytest
+from tzlocal import get_localzone
 
 from icloudpd.cli import format_help, parse
 from icloudpd.config import GlobalConfig, UserConfig
@@ -20,6 +22,8 @@ from pyicloud_ipd.raw_policy import RawTreatmentPolicy
 from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
 from tests.helpers import (
     path_from_project_root,
+    recreate_path,
+    run_cassette,
     run_icloudpd_test,
     run_main,
 )
@@ -31,6 +35,7 @@ class CliTestCase(TestCase):
         self._caplog = caplog
         self.root_path = path_from_project_root(__file__)
         self.fixtures_path = os.path.join(self.root_path, "fixtures")
+        self.vcr_path = os.path.join(self.root_path, "vcr_cassettes")
 
     def test_cli_help(self) -> None:
         result = format_help()
@@ -55,6 +60,7 @@ class CliTestCase(TestCase):
         self.assertIn("--size", result)
         self.assertIn("--live-photo-size", result)
         self.assertIn("--auth-only", result)
+        self.assertIn("--adp-web-access", result)
         self.assertIn("--dry-run", result)
 
         # Test that option descriptions are present
@@ -68,6 +74,16 @@ class CliTestCase(TestCase):
             "Expected directory option format not found in help text",
         )
         self.assertIn("Local directory to use for downloads", result)
+
+    def test_cli_help_in_a_color_terminal(self) -> None:
+        """From Python 3.14 argparse colors help in a terminal; the options must still be listed (#1474)"""
+        with mock.patch.dict(os.environ, {"FORCE_COLOR": "1"}, clear=False):
+            os.environ.pop("NO_COLOR", None)
+            result = format_help()
+        self.assertIn("--help, -h", result)
+        self.assertIn("--directory", result)
+        self.assertIn("--username", result)
+        self.assertNotIn("\x1b[", result)
 
     def test_cli_parser(self) -> None:
         self.assertEqual.__self__.maxDiff = None  # type: ignore[attr-defined]
@@ -199,6 +215,7 @@ class CliTestCase(TestCase):
                         directory="abc",
                         username="u1",
                         auth_only=False,
+                        adp_web_access=False,
                         cookie_directory="~/.pyicloud",
                         password=None,
                         sizes=[AssetVersionSize.ORIGINAL],
@@ -238,6 +255,7 @@ class CliTestCase(TestCase):
                     UserConfig(
                         directory="def",
                         auth_only=False,
+                        adp_web_access=False,
                         cookie_directory="~/.pyicloud",
                         username="u2",
                         password=None,
@@ -315,6 +333,7 @@ class CliTestCase(TestCase):
                         directory="abc",
                         username="u1",
                         auth_only=False,
+                        adp_web_access=False,
                         cookie_directory="~/.pyicloud",
                         password=None,
                         sizes=[AssetVersionSize.ORIGINAL],
@@ -348,7 +367,7 @@ class CliTestCase(TestCase):
                         align_raw=RawTreatmentPolicy.AS_IS,
                         file_match_policy=FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX,
                         skip_created_before=datetime.datetime(
-                            year=2025, month=1, day=2, tzinfo=zoneinfo.ZoneInfo(key="Etc/UTC")
+                            year=2025, month=1, day=2, tzinfo=get_localzone()
                         ),
                         skip_created_after=datetime.timedelta(days=2),
                         skip_photos=False,
@@ -389,6 +408,15 @@ class CliTestCase(TestCase):
                     "2",
                 ]
             )
+
+    def test_live_photo_size_choices(self) -> None:
+        for choice, expected in [
+            ("original", LivePhotoVersionSize.ORIGINAL),
+            ("medium", LivePhotoVersionSize.MEDIUM),
+            ("thumb", LivePhotoVersionSize.THUMB),
+        ]:
+            _, user_configs = parse(["-d", "abc", "--username", "u1", "--live-photo-size", choice])
+            self.assertEqual(user_configs[0].live_photo_size, expected, choice)
 
     def test_cli(self) -> None:
         result = run_main(["--help"])
@@ -473,13 +501,35 @@ class CliTestCase(TestCase):
         )
         self.assertEqual(result.exit_code, 0, "exit code")
 
+    def test_use_os_locale_applies_the_system_locale(self) -> None:
+        with mock.patch("locale.setlocale") as setlocale:
+            result = run_main(["--use-os-locale", "--version"])
+        setlocale.assert_called_once_with(locale.LC_ALL, "")
+        self.assertEqual(result.exit_code, 0)
+
+    def test_use_os_locale_with_missing_locale(self) -> None:
+        """A LANG/LC_ALL that isn't installed gives a warning, not a crash (#1400)"""
+        with mock.patch("locale.setlocale", side_effect=locale.Error("unsupported locale setting")):
+            result = run_main(["--use-os-locale", "--version"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("version:", result.output)
+        self.assertIn(
+            "Cannot use the system locale (unsupported locale setting), using the default locale",
+            result.stderr_bytes.decode("utf-8"),
+        )
+
     def test_missing_directory(self) -> None:
         base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
         # need path removed
         if os.path.exists(base_dir):
             shutil.rmtree(base_dir)
+        # keep cookies out of base_dir (and out of ~/.pyicloud)
+        cookie_dir = base_dir + "_cookie"
+        recreate_path(cookie_dir)
 
-        result = run_main(
+        # replay a failed login instead of signing in to Apple's real servers
+        result = run_cassette(
+            os.path.join(self.vcr_path, "failed_auth.yml"),
             [
                 "--username",
                 "jdoe@gmail.com",
@@ -489,6 +539,8 @@ class CliTestCase(TestCase):
                 "0",
                 "--log-level",
                 "info",
+                "--cookie-directory",
+                cookie_dir,
                 "-d",
                 base_dir,
             ],
@@ -535,6 +587,57 @@ class CliTestCase(TestCase):
 
     def test_conflict_options_delete_after_download_and_keep_icloud_recent_days(self) -> None:
         base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        for days in ["1", "0"]:
+            with self.subTest(days=days):
+                result = run_main(
+                    [
+                        "--username",
+                        "jdoe@gmail.com",
+                        "--password",
+                        "password1",
+                        "-d",
+                        "/tmp",
+                        "--delete-after-download",
+                        "--keep-icloud-recent-days",
+                        days,
+                    ],
+                )
+                self.assertIn(
+                    "--keep-icloud-recent-days and --delete-after-download should not be used together",
+                    result.output,
+                )
+                self.assertEqual(result.exit_code, 2, "exit code")
+
+                self.assertFalse(os.path.exists(base_dir), f"{base_dir} exists")
+
+    def test_conflict_options_auto_delete_and_keep_icloud_recent_days(self) -> None:
+        """Assets --keep-icloud-recent-days moves to Recently Deleted would also be deleted locally (#1272)"""
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        for days in ["90", "0"]:
+            with self.subTest(days=days):
+                result = run_main(
+                    [
+                        "--username",
+                        "jdoe@gmail.com",
+                        "--password",
+                        "password1",
+                        "-d",
+                        "/tmp",
+                        "--auto-delete",
+                        "--keep-icloud-recent-days",
+                        days,
+                    ],
+                )
+                self.assertEqual(result.exit_code, 2, "exit code")
+                self.assertIn(
+                    "--keep-icloud-recent-days and --auto-delete should not be used together",
+                    result.output,
+                )
+
+        self.assertFalse(os.path.exists(base_dir), f"{base_dir} exists")
+
+    def test_conflict_options_skip_created_before_later_than_after(self) -> None:
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
         result = run_main(
             [
                 "--username",
@@ -543,11 +646,58 @@ class CliTestCase(TestCase):
                 "password1",
                 "-d",
                 "/tmp",
-                "--delete-after-download",
-                "--keep-icloud-recent-days",
-                "1",
+                "--skip-created-before",
+                "2025-10-01",
+                "--skip-created-after",
+                "2025-04-01",
+            ],
+        )
+        self.assertEqual(result.exit_code, 2, "exit code")
+        self.assertIn(
+            "--skip-created-before must be earlier than --skip-created-after", result.output
+        )
+
+        self.assertFalse(os.path.exists(base_dir), f"{base_dir} exists")
+
+    def test_conflict_options_skip_created_before_later_than_after_interval(self) -> None:
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        result = run_main(
+            [
+                "--username",
+                "jdoe@gmail.com",
+                "--password",
+                "password1",
+                "-d",
+                "/tmp",
+                "--skip-created-before",
+                "10d",
+                "--skip-created-after",
+                "20d",
             ],
         )
         self.assertEqual(result.exit_code, 2, "exit code")
 
         self.assertFalse(os.path.exists(base_dir), f"{base_dir} exists")
+
+    def test_starter_propagates_exit_code(self) -> None:
+        """Entry script used for binaries must pass cli() return code to sys.exit"""
+        starter_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), os.pardir, "src", "starters", "icloudpd.py"
+        )
+        with (
+            mock.patch(
+                "sys.argv",
+                [
+                    "icloudpd",
+                    "--username",
+                    "jdoe@gmail.com",
+                    "-d",
+                    "/tmp",
+                    "--skip-videos",
+                    "--skip-photos",
+                ],
+            ),
+            self.assertRaises(SystemExit) as context,
+        ):
+            runpy.run_path(starter_path, run_name="__main__")
+        self.assertEqual(context.exception.code, 2, "exit code")

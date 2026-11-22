@@ -9,10 +9,11 @@ import os
 import plistlib
 import zlib
 from datetime import datetime, timedelta, timezone
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple, TypeVar
 from xml.etree import ElementTree
 
 from foundation import version_info
+from pyicloud_ipd.version_size import AssetVersionSize
 
 exif_tool = None
 
@@ -35,7 +36,11 @@ class XMPMetadata(NamedTuple):
 
 
 def generate_xmp_file(
-    logger: logging.Logger, download_path: str, asset_record: dict[str, Any], dry_run: bool
+    logger: logging.Logger,
+    download_path: str,
+    asset_record: dict[str, Any],
+    dry_run: bool,
+    version_size: AssetVersionSize,
 ) -> None:
     sidecar_path: str = download_path + ".xmp"
     can_write_file: bool = True
@@ -68,12 +73,32 @@ def generate_xmp_file(
     # json.dump(asset_record["fields"],         open(download_path + ".ar.json", "w"),         indent=4,        default=str,        sort_keys=True)
 
     if can_write_file:
-        xmp_metadata: XMPMetadata = build_metadata(asset_record)
-        xml_doc: ElementTree.Element = generate_xml(xmp_metadata)
-        if not dry_run:
-            # Write the XML to the file
-            with open(sidecar_path, "wb") as f:
-                f.write(ElementTree.tostring(xml_doc, encoding="utf-8", xml_declaration=True))
+        # a sidecar is extra metadata: failing to write one must not stop the download run
+        try:
+            xmp_metadata: XMPMetadata = build_metadata(asset_record)
+            if version_size == AssetVersionSize.ADJUSTED:
+                # the orientation is read from the edit data, and the adjusted file is already
+                # rendered upright: repeating it makes viewers rotate the photo a second time
+                xmp_metadata = xmp_metadata._replace(Orientation=None)
+            xml_doc: ElementTree.Element = generate_xml(xmp_metadata)
+            if not dry_run:
+                # Write the XML to the file
+                with open(sidecar_path, "wb") as f:
+                    f.write(ElementTree.tostring(xml_doc, encoding="utf-8", xml_declaration=True))
+        except Exception as e:
+            logger.warning(f"Could not write XMP sidecar {sidecar_path}: {e}")
+
+
+T = TypeVar("T")
+
+
+def decode_or_none(decode: Callable[[], T]) -> T | None:
+    """Decode an optional field; data iCloud sends in an unexpected format is left out"""
+    try:
+        return decode()
+    except (zlib.error, ValueError):
+        # ValueError covers bad base64, JSON, UTF-8 and plist data
+        return None
 
 
 def build_metadata(asset_record: dict[str, Any]) -> XMPMetadata:
@@ -104,13 +129,14 @@ def build_metadata(asset_record: dict[str, Any]) -> XMPMetadata:
         is_not_bplist = not_(startswith("YnBsaXN0MD"))
 
         if is_not_crdt(data_value) and is_not_bplist(data_value):  # not "crdt" and not "bplist00"
-            adjustments = json.loads(
-                zlib.decompress(
-                    base64.b64decode(asset_record["fields"]["adjustmentSimpleDataEnc"]["value"]),
-                    -zlib.MAX_WBITS,
-                )
+            adjustments = decode_or_none(
+                lambda: json.loads(zlib.decompress(base64.b64decode(data_value), -zlib.MAX_WBITS))
             )
-            if "metadata" in adjustments and "orientation" in adjustments["metadata"]:
+            if (
+                isinstance(adjustments, dict)
+                and "metadata" in adjustments
+                and "orientation" in adjustments["metadata"]
+            ):
                 orientation = adjustments["metadata"]["orientation"]
 
     make, digital_source_type = None, None
@@ -123,14 +149,16 @@ def build_metadata(asset_record: dict[str, Any]) -> XMPMetadata:
 
     keywords = None
     if "keywordsEnc" in asset_record["fields"] and len(asset_record["fields"]["keywordsEnc"]) > 0:
-        keywords = plistlib.loads(
-            base64.b64decode(asset_record["fields"]["keywordsEnc"]["value"]),
+        keywords = decode_or_none(
+            lambda: plistlib.loads(base64.b64decode(asset_record["fields"]["keywordsEnc"]["value"]))
         )
 
+    location = None
     if "locationEnc" in asset_record["fields"]:
-        location = plistlib.loads(
-            base64.b64decode(asset_record["fields"]["locationEnc"]["value"]),
+        location = decode_or_none(
+            lambda: plistlib.loads(base64.b64decode(asset_record["fields"]["locationEnc"]["value"]))
         )
+    if isinstance(location, dict):
         gps_altitude = location.get("alt")
         gps_latitude = location.get("lat")
         gps_longitude = location.get("lon")

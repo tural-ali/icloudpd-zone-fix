@@ -1,4 +1,5 @@
 import datetime
+import errno
 import inspect
 import logging
 import os
@@ -11,6 +12,7 @@ import piexif
 import pytest
 from piexif._exceptions import InvalidImageDataError
 from requests import Response
+from tzlocal import get_localzone
 
 from icloudpd import constants
 from icloudpd.string_helpers import truncate_middle
@@ -107,7 +109,7 @@ class DownloadPhotoNameIDTestCase(TestCase):
         photo_mtime = os.path.getmtime(
             os.path.join(data_dir, os.path.normpath("2018/07/31/IMG_7409_QVk2Yyt.JPG"))
         )
-        photo_modified_time = datetime.datetime.fromtimestamp(photo_mtime, datetime.timezone.utc)
+        photo_modified_time = datetime.datetime.fromtimestamp(photo_mtime, datetime.UTC)
         self.assertEqual("2018-07-31 07:22:24", photo_modified_time.strftime("%Y-%m-%d %H:%M:%S"))
 
     def test_download_photos_and_set_exif_name_id7(self) -> None:
@@ -177,8 +179,8 @@ class DownloadPhotoNameIDTestCase(TestCase):
         )
         # 2018:07:31 07:22:24 utc
         expectedDatetime = (
-            datetime.datetime(2018, 7, 31, 7, 22, 24, tzinfo=datetime.timezone.utc)
-            .astimezone()
+            datetime.datetime(2018, 7, 31, 7, 22, 24, tzinfo=datetime.UTC)
+            .astimezone(get_localzone())
             .strftime("%Y-%m-%d %H:%M:%S%z")
         )
         self.assertIn(
@@ -352,6 +354,7 @@ class DownloadPhotoNameIDTestCase(TestCase):
                             if (f[2] == "photo" and f[1].endswith(".MOV"))
                             else AssetVersionSize.ORIGINAL,
                             ANY,  # filename_builder
+                            ".part",  # temp_suffix
                         ),
                         files_to_download_ext,
                     )
@@ -385,8 +388,9 @@ class DownloadPhotoNameIDTestCase(TestCase):
         base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
 
         with mock.patch("icloudpd.download.open", create=True) as m:
-            # Raise IOError when we try to write to the destination file
-            m.side_effect = IOError
+            # Raise an OSError when we try to write to the destination file
+            error = OSError(errno.EINVAL, "Invalid argument")
+            m.side_effect = error
 
             data_dir, result = run_icloudpd_test(
                 self.assertEqual,
@@ -417,9 +421,8 @@ class DownloadPhotoNameIDTestCase(TestCase):
             )
             self.assertIn(
                 "IOError while writing file to "
-                f"{os.path.join(data_dir, os.path.normpath('2018/07/31/IMG_7409_QVk2Yyt.JPG'))}. "
-                "You might have run out of disk space, or the file might "
-                "be too large for your OS. Skipping this file...",
+                f"{os.path.join(data_dir, os.path.normpath('2018/07/31/IMG_7409_QVk2Yyt.JPG'))}: "
+                f"{error}. Skipping this file...",
                 result.output,
             )
             assert result.exit_code == 0
@@ -783,6 +786,51 @@ class DownloadPhotoNameIDTestCase(TestCase):
 
                     assert result.exit_code == 0
 
+    def test_adjusted_and_original_name_id7(self) -> None:
+        """Adjusted file gets the same id suffix as the original, so assets with the same name don't collide"""
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+
+        with mock.patch("icloudpd.download.download_media") as dp_patched:
+            dp_patched.return_value = True
+
+            with mock.patch("icloudpd.download.os.utime") as ut_patched:
+                ut_patched.return_value = None
+
+                with mock.patch.object(
+                    PhotoAsset, "versions", new_callable=mock.PropertyMock
+                ) as pa:
+                    pa.return_value = {
+                        AssetVersionSize.ORIGINAL: AssetVersion(1, "http", "public.jpeg", "blah"),
+                        AssetVersionSize.ADJUSTED: AssetVersion(2, "ftp", "public.jpeg", "blah2"),
+                    }
+
+                    data_dir, result = run_icloudpd_test(
+                        self.assertEqual,
+                        self.root_path,
+                        base_dir,
+                        "listing_photos.yml",
+                        [],
+                        [],
+                        [
+                            "--username",
+                            "jdoe@gmail.com",
+                            "--password",
+                            "password1",
+                            "--recent",
+                            "1",
+                            "--size",
+                            "original",
+                            "--size",
+                            "adjusted",
+                            "--no-progress-bar",
+                            "--file-match-policy",
+                            "name-id7",
+                        ],
+                    )
+                    self.assertIn("IMG_7409_QVk2Yyt.JPG", result.output)
+                    self.assertIn("IMG_7409_QVk2Yyt-adjusted.JPG", result.output)
+                    assert result.exit_code == 0
+
     def test_force_size_name_id7(self) -> None:
         base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
 
@@ -894,7 +942,9 @@ class DownloadPhotoNameIDTestCase(TestCase):
     def test_creation_date_without_century_name_id7(self) -> None:
         base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
 
-        files_to_download = [("5/01/01", "IMG_7409_QVk2Yyt.JPG")]
+        # Python 3.14 zero-pads %Y on Linux too, like macOS and Windows already did
+        year_folder = "5/01/01" if sys.version_info < (3, 14) else "0005/01/01"
+        files_to_download = [(year_folder, "IMG_7409_QVk2Yyt.JPG")]
 
         with mock.patch.object(PhotoAsset, "created", new_callable=mock.PropertyMock) as dt_mock:
             # Can't mock `astimezone` because it's a readonly property, so have to
@@ -939,7 +989,7 @@ class DownloadPhotoNameIDTestCase(TestCase):
                 result.output,
             )
             self.assertIn(
-                f"Downloading {truncate_middle(os.path.join(data_dir, os.path.normpath('5/01/01/IMG_7409_QVk2Yyt.JPG')), 96)}",
+                f"Downloading {truncate_middle(os.path.join(data_dir, os.path.normpath(f'{year_folder}/IMG_7409_QVk2Yyt.JPG')), 96)}",
                 result.output,
             )
             self.assertIn("All photos and videos have been downloaded", result.output)
@@ -1163,8 +1213,8 @@ class DownloadPhotoNameIDTestCase(TestCase):
                 )
                 # 2018:07:31 07:22:24 utc
                 expectedDatetime = (
-                    datetime.datetime(2018, 7, 31, 7, 22, 24, tzinfo=datetime.timezone.utc)
-                    .astimezone()
+                    datetime.datetime(2018, 7, 31, 7, 22, 24, tzinfo=datetime.UTC)
+                    .astimezone(get_localzone())
                     .strftime("%Y-%m-%d %H:%M:%S%z")
                 )
                 self.assertIn(
@@ -1221,7 +1271,7 @@ class DownloadPhotoNameIDTestCase(TestCase):
         photo_mtime = os.path.getmtime(
             os.path.join(data_dir, os.path.normpath("2018/07/31/IMG_7409_QVk2Yyt.JPG"))
         )
-        photo_modified_time = datetime.datetime.fromtimestamp(photo_mtime, datetime.timezone.utc)
+        photo_modified_time = datetime.datetime.fromtimestamp(photo_mtime, datetime.UTC)
         self.assertEqual("2018-07-31 07:22:24", photo_modified_time.strftime("%Y-%m-%d %H:%M:%S"))
 
         assert result.exit_code == 0
@@ -1516,7 +1566,7 @@ class DownloadPhotoNameIDTestCase(TestCase):
         photo_mtime = os.path.getmtime(
             os.path.join(data_dir, os.path.normpath("2018/07/31/IMG_7409_QVk2Yyt.JPG"))
         )
-        photo_modified_time = datetime.datetime.fromtimestamp(photo_mtime, datetime.timezone.utc)
+        photo_modified_time = datetime.datetime.fromtimestamp(photo_mtime, datetime.UTC)
         self.assertEqual("2018-07-31 07:22:24", photo_modified_time.strftime("%Y-%m-%d %H:%M:%S"))
 
         assert result.exit_code == 0
@@ -2262,12 +2312,22 @@ class DownloadPhotoNameIDTestCase(TestCase):
             "Skipping IMG_7404_QVI5TWx.MOV, only downloading photos.",
             result.output,
         )
+        # Dates are parsed as local timezone, so compare with local timezone
+        local_tz = get_localzone()
+        created_7407 = datetime.datetime(2018, 7, 30, 11, 44, 5, 108000, datetime.UTC).astimezone(
+            local_tz
+        )
+        created_7408 = datetime.datetime(2018, 7, 30, 11, 44, 10, 176000, datetime.UTC).astimezone(
+            local_tz
+        )
+        target_date = datetime.datetime(2018, 7, 31, 0, 0, 0, 0, tzinfo=local_tz)
+
         self.assertIn(
-            "Skipping IMG_7407_QVovd0F.JPG, as it was created 2018-07-30 11:44:05.108000+00:00, before 2018-07-31 00:00:00+00:00.",
+            f"Skipping IMG_7407_QVovd0F.JPG, as it was created {created_7407}, before {target_date}.",
             result.output,
         )
         self.assertIn(
-            "Skipping IMG_7408_QVI4T2l.JPG, as it was created 2018-07-30 11:44:10.176000+00:00, before 2018-07-31 00:00:00+00:00.",
+            f"Skipping IMG_7408_QVI4T2l.JPG, as it was created {created_7408}, before {target_date}.",
             result.output,
         )
         self.assertIn("All photos have been downloaded", result.output)
@@ -2277,7 +2337,7 @@ class DownloadPhotoNameIDTestCase(TestCase):
         photo_mtime = os.path.getmtime(
             os.path.join(data_dir, os.path.normpath("2018/07/31/IMG_7409_QVk2Yyt.JPG"))
         )
-        photo_modified_time = datetime.datetime.fromtimestamp(photo_mtime, datetime.timezone.utc)
+        photo_modified_time = datetime.datetime.fromtimestamp(photo_mtime, datetime.UTC)
         self.assertEqual("2018-07-31 07:22:24", photo_modified_time.strftime("%Y-%m-%d %H:%M:%S"))
 
     def test_download_and_skip_new_name_id7(self) -> None:
@@ -2339,8 +2399,15 @@ class DownloadPhotoNameIDTestCase(TestCase):
                 result.output,
             )
 
+        # Dates are parsed as local timezone, so compare with local timezone
+        local_tz = get_localzone()
+        created_7409 = datetime.datetime(2018, 7, 31, 7, 22, 24, 816000, datetime.UTC).astimezone(
+            local_tz
+        )
+        target_date = datetime.datetime(2018, 7, 31, 0, 0, 0, 0, tzinfo=local_tz)
+
         self.assertIn(
-            "Skipping IMG_7409_QVk2Yyt.JPG, as it was created 2018-07-31 07:22:24.816000+00:00, after 2018-07-31 00:00:00+00:00.",
+            f"Skipping IMG_7409_QVk2Yyt.JPG, as it was created {created_7409}, after {target_date}.",
             result.output,
         )
         self.assertIn("All photos have been downloaded", result.output)

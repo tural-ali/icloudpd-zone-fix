@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import re
+import time
 import typing
 from datetime import datetime
 from typing import Any, Callable, Dict, Generator, Sequence, Tuple, cast
@@ -110,6 +111,12 @@ def filename_with_fallback(asset_id: str, item_type_extension: str) -> Callable[
 
 
 logger = logging.getLogger(__name__)
+
+INDEXING_STATE_ATTEMPTS = 15
+INDEXING_STATE_RETRY_DELAY_SECONDS = 4
+
+# albumType of a folder in the album list; albums are 0
+FOLDER_ALBUM_TYPE = 3
 
 
 def download_asset(session: Session, url: str, start: int = 0) -> Response:
@@ -277,12 +284,17 @@ class PhotoLibrary:
         session: Session,
         zone_id: Dict[str, Any],
         library_type: str,
+        ignore_indexing_state: bool = False,
     ):
         self.service_endpoint = service_endpoint
         self.params = params
         self.session = session
         self.zone_id = zone_id
         self.library_type = library_type
+        self.ignore_indexing_state = ignore_indexing_state
+        # set when the run continued past a RUNNING state because of the option, so the
+        # end of the run can say that the listing may be incomplete
+        self.indexing_state_ignored = False
 
         url = f"{self.service_endpoint}/records/query?{urlencode(self.params)}"
         json_data = json.dumps(
@@ -292,13 +304,44 @@ class PhotoLibrary:
             }
         )
 
-        request = self.session.post(url, data=json_data, headers={"Content-type": "text/plain"})
-        response = request.json()
-        indexing_state = response["records"][0]["fields"]["state"]["value"]
-        if indexing_state != "FINISHED":
-            raise PyiCloudServiceNotActivatedException(
-                ("Apple iCloud Photo Library has not finished indexing yet"), None
-            )
+        # Apple may report RUNNING for a library that is ready, flipping to
+        # FINISHED only on some calls, so re-check before giving up (#1387)
+        all_running = True
+        for attempt in range(1, INDEXING_STATE_ATTEMPTS + 1):
+            request = self.session.post(url, data=json_data, headers={"Content-type": "text/plain"})
+            response = request.json()
+            indexing_state = response["records"][0]["fields"]["state"]["value"]
+            if indexing_state == "FINISHED":
+                break
+            if not (
+                indexing_state == "RUNNING"
+                and response["records"][0].get("recordType") == "CheckIndexingState"
+            ):
+                all_running = False
+            if attempt < INDEXING_STATE_ATTEMPTS:
+                logger.debug(
+                    "Library indexing state is %s (attempt %d/%d), retrying in %ds",
+                    indexing_state,
+                    attempt,
+                    INDEXING_STATE_ATTEMPTS,
+                    INDEXING_STATE_RETRY_DELAY_SECONDS,
+                )
+                time.sleep(INDEXING_STATE_RETRY_DELAY_SECONDS)
+        else:
+            # iCloud may keep answering RUNNING for a library that lists normally (#1387);
+            # continue only on request, and only when every answer was a RUNNING record
+            if self.ignore_indexing_state and all_running:
+                logger.warning(
+                    "Library %s is still reported as indexing (RUNNING on all %d checks), "
+                    "continuing because of --ignore-indexing-state; the listing may be incomplete",
+                    self.zone_id.get("zoneName"),
+                    INDEXING_STATE_ATTEMPTS,
+                )
+                self.indexing_state_ignored = True
+            else:
+                raise PyiCloudServiceNotActivatedException(
+                    ("Apple iCloud Photo Library has not finished indexing yet"), None
+                )
 
     @property
     def albums(self) -> Dict[str, "PhotoAlbum"]:
@@ -314,23 +357,14 @@ class PhotoLibrary:
             for (name, props) in self.SMART_FOLDERS.items()
         }
 
-        for folder in self._fetch_folders():
-            # FIXME: Handle subfolders
-            if folder["recordName"] in ("----Root-Folder----", "----Project-Root-Folder----") or (
-                folder["fields"].get("isDeleted") and folder["fields"]["isDeleted"]["value"]
-            ):
-                continue
-
-            folder_id = folder["recordName"]
-            folder_obj_type = f"CPLContainerRelationNotDeletedByAssetDate:{folder_id}"
-            folder_name = base64.b64decode(folder["fields"]["albumNameEnc"]["value"]).decode(
-                "utf-8"
-            )
+        for album_path, record in self._fetch_folders():
+            album_id = record["recordName"]
+            album_obj_type = f"CPLContainerRelationNotDeletedByAssetDate:{album_id}"
             query_filter = [
                 {
                     "fieldName": "parentId",
                     "comparator": "EQUALS",
-                    "fieldValue": {"type": "STRING", "value": folder_id},
+                    "fieldValue": {"type": "STRING", "value": album_id},
                 }
             ]
 
@@ -338,31 +372,79 @@ class PhotoLibrary:
                 self.params,
                 self.session,
                 self.service_endpoint,
-                folder_name,
+                album_path,
                 "CPLContainerRelationLiveByAssetDate",
-                folder_obj_type,
+                album_obj_type,
                 query_filter,
                 zone_id=self.zone_id,
             )
-            albums[folder_name] = album
+            albums[album_path] = album
 
         return albums
 
-    def _fetch_folders(self) -> Sequence[Dict[str, Any]]:
+    def _query_folders(self, parent_id: str | None) -> list[Dict[str, Any]]:
+        """Album and folder records directly in the folder parent_id, or at the top level"""
+        url = f"{self.service_endpoint}/records/query?{urlencode(self.params)}"
+        query: Dict[str, Any] = {
+            "query": {"recordType": "CPLAlbumByPositionLive"},
+            "zoneID": self.zone_id,
+        }
+        if parent_id is not None:
+            query["query"]["filterBy"] = [
+                {
+                    "fieldName": "parentId",
+                    "comparator": "EQUALS",
+                    "fieldValue": {"type": "STRING", "value": parent_id},
+                }
+            ]
+        records: list[Dict[str, Any]] = []
+        markers: set[str] = set()
+        while True:
+            request = self.session.post(
+                url, data=json.dumps(query), headers={"Content-type": "text/plain"}
+            )
+            response = request.json()
+            records.extend(response["records"])
+            # iCloud returns the albums in pages; continuationMarker asks for the next one.
+            # A marker seen before would only repeat the same page, so stop there.
+            marker = response.get("continuationMarker")
+            if not marker or marker in markers:
+                break
+            markers.add(marker)
+            query["continuationMarker"] = marker
+
+        return records
+
+    def _fetch_folders(self) -> Sequence[Tuple[str, Dict[str, Any]]]:
+        """Album records with their path, including albums in folders (#482, #1071).
+
+        The album list only holds the top level. The content of a folder (albumType 3)
+        comes from the same query filtered on the folder's id, so folders are walked one
+        level at a time. An album in a folder gets the path "Folder/Subfolder/Album";
+        folders themselves hold no photos and are not returned."""
         if self.library_type == "shared":
             return []
-        url = f"{self.service_endpoint}/records/query?{urlencode(self.params)}"
-        json_data = json.dumps(
-            {
-                "query": {"recordType": "CPLAlbumByPositionLive"},
-                "zoneID": self.zone_id,
-            }
-        )
-
-        request = self.session.post(url, data=json_data, headers={"Content-type": "text/plain"})
-        response = request.json()
-
-        return typing.cast(Sequence[Dict[str, Any]], response["records"])
+        albums: list[Tuple[str, Dict[str, Any]]] = []
+        visited: set[str] = set()
+        pending: list[Tuple[str | None, str]] = [(None, "")]
+        while pending:
+            parent_id, prefix = pending.pop(0)
+            for record in self._query_folders(parent_id):
+                record_id = record["recordName"]
+                fields = record["fields"]
+                if record_id in ("----Root-Folder----", "----Project-Root-Folder----") or (
+                    fields.get("isDeleted") and fields["isDeleted"]["value"]
+                ):
+                    continue
+                name = base64.b64decode(fields["albumNameEnc"]["value"]).decode("utf-8")
+                if fields.get("albumType", {}).get("value") == FOLDER_ALBUM_TYPE:
+                    # a folder listed twice would otherwise be walked forever
+                    if record_id not in visited:
+                        visited.add(record_id)
+                        pending.append((record_id, f"{prefix}{name}/"))
+                else:
+                    albums.append((f"{prefix}{name}", record))
+        return albums
 
     @property
     def all(self) -> "PhotoAlbum":
@@ -374,6 +456,18 @@ class PhotoLibrary:
             self.WHOLE_COLLECTION["list_type"],
             self.WHOLE_COLLECTION["obj_type"],
             query_filter=self.WHOLE_COLLECTION["query_filter"],
+            zone_id=self.zone_id,
+        )
+
+    @property
+    def hidden(self) -> "PhotoAlbum":
+        return PhotoAlbum(
+            self.params,
+            self.session,
+            self.service_endpoint,
+            "Hidden",
+            "CPLAssetAndMasterHiddenByAssetDate",
+            "CPLAssetHiddenByAssetDate",
             zone_id=self.zone_id,
         )
 
@@ -397,36 +491,62 @@ class PhotosService(PhotoLibrary):
     This also acts as a way to access the user's primary library.
     """
 
-    def __init__(self, service_root: str, session: PyiCloudSession, params: Dict[str, Any]):
+    def __init__(
+        self,
+        service_root: str,
+        session: PyiCloudSession,
+        params: Dict[str, Any],
+        ignore_indexing_state: bool = False,
+    ):
         self.session = session
         self.params = dict(params)
         self._service_root = service_root
 
         self._private_libraries: Dict[str, PhotoLibrary] | None = None
         self._shared_libraries: Dict[str, PhotoLibrary] | None = None
-        self._private_zone_ids: Sequence[Dict[str, Any]] | None = None
 
         self.params.update({"remapEnums": True, "getCurrentSyncToken": True})
 
-        # Apple does not guarantee that the primary library zone is named
-        # exactly "PrimarySync". Discover the active zone first so migrated
-        # accounts using names such as "PrimarySync1" can be initialized.
+        # Initialize as primary library
         service_endpoint = self.get_service_endpoint("private")
-        private_zone_ids = self._fetch_zone_ids("private")
-        self._private_zone_ids = private_zone_ids
-        zone_id = next(
-            (
-                candidate
-                for candidate in private_zone_ids
-                if candidate.get("zoneName", "").startswith("PrimarySync")
-            ),
-            None,
-        )
-        if zone_id is None:
-            raise PyiCloudServiceNotActivatedException(
-                "Apple iCloud Photo Library primary zone was not found", None
+        zone_id: Dict[str, Any] = {"zoneName": "PrimarySync"}
+        try:
+            super().__init__(
+                service_endpoint,
+                self.params,
+                self.session,
+                zone_id,
+                "private",
+                ignore_indexing_state=ignore_indexing_state,
             )
-        super().__init__(service_endpoint, self.params, self.session, zone_id, "private")
+        except PyiCloudServiceNotActivatedException as error:
+            # On some accounts Apple moved the library to another zone, such as PrimarySync1,
+            # and PrimarySync no longer exists (#1361). Also list the zones (debug) when
+            # PrimarySync exists but its indexing state check fails, to see whether the same
+            # move is behind it
+            if error.code not in ("ZONE_NOT_FOUND", None):
+                raise
+            zone_ids = self._listed_zone_ids()
+            moved = (
+                self._moved_primary_zone_id(zone_ids)
+                if error.code == "ZONE_NOT_FOUND" and zone_ids is not None
+                else None
+            )
+            if moved is None:
+                raise
+            logger.warning(
+                "The ZONE_NOT_FOUND error above can be ignored: this account's photo library is "
+                "in zone %s, not PrimarySync",
+                moved["zoneName"],
+            )
+            super().__init__(
+                service_endpoint,
+                self.params,
+                self.session,
+                moved,
+                "private",
+                ignore_indexing_state=ignore_indexing_state,
+            )
 
         # TODO: Does syncToken ever change?
         # self.params.update({
@@ -450,34 +570,69 @@ class PhotosService(PhotoLibrary):
 
         return self._shared_libraries
 
+    def _listed_zone_ids(self) -> Sequence[Dict[str, Any]] | None:
+        """The private zones, logged at debug level; None when the list can't be read"""
+        try:
+            zone_ids = self._fetch_zone_ids("private")
+        except Exception as error:
+            logger.debug("Could not list the photo library zones: %s", error)
+            return None
+        logger.debug("Photo library zones: %s", ", ".join(str(z.get("zoneName")) for z in zone_ids))
+        return zone_ids
+
+    @staticmethod
+    def _moved_primary_zone_id(zone_ids: Sequence[Dict[str, Any]]) -> Dict[str, Any] | None:
+        """The zone the primary library moved to, when PrimarySync doesn't exist: the first
+        listed zone whose name starts with PrimarySync"""
+        candidates = [
+            z
+            for z in zone_ids
+            if str(z.get("zoneName", "")).startswith("PrimarySync")
+            and z.get("zoneName") != "PrimarySync"
+        ]
+        if len(candidates) > 1:
+            logger.warning(
+                "Several photo library zones could be the library (%s); using %s",
+                ", ".join(str(z["zoneName"]) for z in candidates),
+                candidates[0]["zoneName"],
+            )
+        return candidates[0] if candidates else None
+
+    def _fetch_zone_ids(self, library_type: str) -> Sequence[Dict[str, Any]]:
+        """IDs of the zones that exist: without deleted zones, and without entries that only
+        carry an error (zones/list can return those next to the healthy ones)"""
+        url = f"{self.get_service_endpoint(library_type)}/zones/list"
+        request = self.session.post(url, data="{}", headers={"Content-type": "text/plain"})
+        response = request.json()
+        return [
+            zone["zoneID"]
+            for zone in response["zones"]
+            if not zone.get("deleted")
+            and "serverErrorCode" not in zone
+            and "zoneID" in zone
+            and zone["zoneID"].get("zoneName")
+        ]
+
     def _fetch_libraries(self, library_type: str) -> Dict[str, PhotoLibrary]:
         try:
-            libraries = {}
+            libraries: Dict[str, PhotoLibrary] = {}
             service_endpoint = self.get_service_endpoint(library_type)
-            zone_ids = (
-                self._private_zone_ids
-                if library_type == "private" and self._private_zone_ids is not None
-                else self._fetch_zone_ids(library_type)
-            )
-            for zone_id in zone_ids:
-                zone_name = zone_id["zoneName"]
-                libraries[zone_name] = PhotoLibrary(
+            for zone_id in self._fetch_zone_ids(library_type):
+                if library_type == "private" and zone_id == self.zone_id:
+                    # the primary library is this object; don't check its indexing state again
+                    libraries[zone_id["zoneName"]] = self
+                    continue
+                libraries[zone_id["zoneName"]] = PhotoLibrary(
                     service_endpoint,
                     self.params,
                     self.session,
                     zone_id=zone_id,
                     library_type=library_type,
+                    ignore_indexing_state=self.ignore_indexing_state,
                 )
         except Exception as e:
             logger.error(f"library exception: {str(e)}")
         return libraries
-
-    def _fetch_zone_ids(self, library_type: str) -> Sequence[Dict[str, Any]]:
-        service_endpoint = self.get_service_endpoint(library_type)
-        url = f"{service_endpoint}/zones/list"
-        request = self.session.post(url, data="{}", headers={"Content-type": "text/plain"})
-        response = request.json()
-        return [zone["zoneID"] for zone in response["zones"] if not zone.get("deleted")]
 
     def get_service_endpoint(self, library_type: str) -> str:
         return f"{self._service_root}/database/1/com.apple.photos.cloud/production/{library_type}"
@@ -541,6 +696,7 @@ class PhotoAlbum:
 
     @property
     def photos(self) -> Generator["PhotoAsset", Any, None]:
+        previous_master_records: Dict[str, Any] = {}
         while True:
             request = self.photos_request()
 
@@ -556,23 +712,36 @@ class PhotoAlbum:
 
             response = request.json()
 
-            asset_records = {}
-            master_records = []
+            # Iterate per CPLAsset, not per CPLMaster: several assets can share one master (e.g. Photos'
+            # "Duplicate", which copies the asset but not the original file). Apple then returns the master
+            # once and each asset separately, and startRank counts assets. Keying assets by master id kept only
+            # the last asset of such a group (the others were never yielded), and advancing the offset by the
+            # number of masters made the next page start inside this one (one asset yielded twice).
+            asset_records = []
+            master_records: Dict[str, Any] = {}
             for rec in response["records"]:
                 if rec["recordType"] == "CPLAsset":
-                    master_id = rec["fields"]["masterRef"]["value"]["recordName"]
-                    asset_records[master_id] = rec
+                    asset_records.append(rec)
                 elif rec["recordType"] == "CPLMaster":
-                    master_records.append(rec)
+                    master_records[rec["recordName"]] = rec
 
-            master_records_len = len(master_records)
-            if master_records_len:
-                for master_record in master_records:
-                    record_name = master_record["recordName"]
-                    yield PhotoAsset(master_record, asset_records[record_name])
-                    self.increment_offset(1)
-            else:
+            if not asset_records:
                 break
+            for asset_record in asset_records:
+                master_id = asset_record["fields"]["masterRef"]["value"]["recordName"]
+                master_record = master_records.get(master_id) or previous_master_records.get(
+                    master_id
+                )
+                if master_record is None:
+                    logger.warning(
+                        "Skipping asset %s: its master record %s was not returned",
+                        asset_record.get("recordName"),
+                        master_id,
+                    )
+                else:
+                    yield PhotoAsset(master_record, asset_record)
+                self.increment_offset(1)
+            previous_master_records = master_records
 
     def increment_offset(self, value: int) -> None:
         self.offset += value
@@ -752,6 +921,7 @@ class PhotoAsset:
         "public.heif": AssetItemType.IMAGE,
         "public.jpeg": AssetItemType.IMAGE,
         "public.png": AssetItemType.IMAGE,
+        "public.jpeg-xl": AssetItemType.IMAGE,
         "com.apple.quicktime-movie": AssetItemType.MOVIE,
         "com.adobe.raw-image": AssetItemType.IMAGE,
         "com.canon.cr2-raw-image": AssetItemType.IMAGE,
@@ -886,6 +1056,15 @@ class PhotoAsset:
         return dt
 
     @property
+    def has_asset_date(self) -> bool:
+        """False when iCloud gave no usable creation date and asset_date fell back to 1970"""
+        try:
+            self._asset_record["fields"]["assetDate"]["value"] / 1000.0
+            return True
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    @property
     def added_date(self) -> datetime:
         dt = datetime.fromtimestamp(
             self._asset_record["fields"]["addedDate"]["value"] / 1000.0, tz=pytz.utc
@@ -898,6 +1077,15 @@ class PhotoAsset:
             self._master_record["fields"]["resOriginalWidth"]["value"],
             self._master_record["fields"]["resOriginalHeight"]["value"],
         )
+
+    @property
+    def is_screenshot(self) -> bool:
+        """Whether iCloud marks the asset as a screenshot"""
+        subtype = self._asset_record.get("fields", {}).get("assetSubtypeV2", {}).get("value")
+        try:
+            return subtype is not None and int(subtype) == 3
+        except (TypeError, ValueError):
+            return False
 
     @property
     def item_type(self) -> AssetItemType | None:
@@ -915,7 +1103,26 @@ class PhotoAsset:
         from foundation.core import compose
         from foundation.string_utils import endswith, lower
 
-        is_image_ext = compose(endswith((".heic", ".png", ".jpg", ".jpeg")), lower)
+        is_image_ext = compose(
+            endswith(
+                (
+                    ".heic",
+                    ".heif",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".jxl",
+                    ".webp",
+                    ".gif",
+                    ".tif",
+                    ".tiff",
+                    ".avif",
+                    ".bmp",
+                    ".dng",
+                )
+            ),
+            lower,
+        )
 
         if is_image_ext(self.filename):
             return AssetItemType.IMAGE

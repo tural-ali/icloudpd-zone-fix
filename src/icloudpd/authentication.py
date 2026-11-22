@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Mapping, Tuple
 from icloudpd.mfa_provider import MFAProvider
 from icloudpd.status import Status, StatusExchange
 from pyicloud_ipd.base import PyiCloudService
-from pyicloud_ipd.exceptions import PyiCloudFailedMFAException
+from pyicloud_ipd.exceptions import PyiCloudFailedLoginException, PyiCloudFailedMFAException
 
 
 def prompt_int_range(message: str, default: str, min_val: int, max_val: int) -> int:
@@ -69,28 +69,38 @@ def authenticator(
     response_observer: Callable[[Mapping[str, Any]], None] | None = None,
     cookie_directory: str | None = None,
     client_id: str | None = None,
+    adp_web_access: bool = False,
+    ignore_indexing_state: bool = False,
 ) -> PyiCloudService:
     """Authenticate with iCloud username and password"""
     logger.debug("Authenticating...")
     valid_password: List[str] = []
+    password_sources: List[str] = []
 
     def password_provider(username: str, valid_password: List[str]) -> str | None:
-        for _, _pair in password_providers.items():
+        for name, _pair in password_providers.items():
             reader, _ = _pair
             password = reader(username)
             if password:
                 valid_password.append(password)
+                password_sources.append(name)
                 return password
         return None
 
-    icloud = PyiCloudService(
-        domain,
-        username,
-        partial(password_provider, username, valid_password),
-        response_observer,
-        cookie_directory=cookie_directory,
-        client_id=client_id,
-    )
+    try:
+        icloud = PyiCloudService(
+            domain,
+            username,
+            partial(password_provider, username, valid_password),
+            response_observer,
+            cookie_directory=cookie_directory,
+            client_id=client_id,
+            ignore_indexing_state=ignore_indexing_state,
+        )
+    except PyiCloudFailedLoginException as error:
+        # which provider gave the password Apple refused, for the hints after the error (#1348)
+        error.password_provider = password_sources[-1] if password_sources else None
+        raise
 
     if not icloud:
         raise NotImplementedError("None of providers gave password")
@@ -114,7 +124,26 @@ def authenticator(
         notificator()
         request_2sa(icloud, logger)
 
+    if adp_web_access:
+        icloud.request_pcs_consent("photos")
+
     return icloud
+
+
+def request_security_key(
+    icloud: PyiCloudService, logger: logging.Logger, challenge: Mapping[str, Any]
+) -> None:
+    """Confirm the login with a security key (FIDO) registered to the account."""
+    key_names = ", ".join(challenge.get("keyNames") or [])
+    logger.info("This account uses security keys instead of codes")
+    names_hint = f" ({key_names})" if key_names else ""
+    echo(f"Plug in a security key{names_hint} and touch it")
+    if not icloud.confirm_security_key(challenge):
+        raise PyiCloudFailedMFAException("Failed to verify the security key")
+    logger.info(
+        "Great, you're all set up. The script can now be run without "
+        "user interaction until 2FA expires."
+    )
 
 
 def request_2sa(icloud: PyiCloudService, logger: logging.Logger) -> None:
@@ -152,6 +181,13 @@ def request_2sa(icloud: PyiCloudService, logger: logging.Logger) -> None:
 def request_2fa(icloud: PyiCloudService, logger: logging.Logger) -> None:
     """Request two-factor authentication."""
     devices = icloud.get_trusted_phone_numbers()
+
+    # Accounts with security keys (FIDO) list no trusted phone numbers and get no code
+    if not devices:
+        security_key_challenge = icloud.get_security_key_challenge()
+        if security_key_challenge:
+            request_security_key(icloud, logger, security_key_challenge)
+            return
 
     # Trigger push notification to trusted devices before prompting for code.
     # Apple's auth flow (2026+) requires a PUT to /verify/trusteddevice/securitycode

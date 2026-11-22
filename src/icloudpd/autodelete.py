@@ -11,11 +11,11 @@ from tzlocal import get_localzone
 
 from icloudpd import graduation
 from icloudpd.paths import local_download_path
-from pyicloud_ipd.asset_version import calculate_version_filename
+from pyicloud_ipd.asset_version import add_suffix_to_filename, calculate_version_filename
 from pyicloud_ipd.raw_policy import RawTreatmentPolicy
-from pyicloud_ipd.services.photos import PhotoLibrary
-from pyicloud_ipd.utils import disambiguate_filenames
-from pyicloud_ipd.version_size import AssetVersionSize, VersionSize
+from pyicloud_ipd.services.photos import PhotoAsset, PhotoLibrary
+from pyicloud_ipd.utils import disambiguate_filenames, size_to_suffix
+from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize, VersionSize
 
 
 def delete_file(logger: logging.Logger, path: str) -> bool:
@@ -48,6 +48,8 @@ def autodelete_photos(
     _sizes: Sequence[AssetVersionSize],
     lp_filename_generator: Callable[[str], str],
     raw_policy: RawTreatmentPolicy,
+    filename_builder: Callable[[PhotoAsset], str],
+    live_photo_directory: str | None = None,
 ) -> None:
     """
     Scans the "Recently Deleted" folder and deletes any matching files
@@ -85,6 +87,13 @@ def autodelete_photos(
                 date_path = folder_structure.format(created_date)
 
         download_dir = os.path.join(directory, date_path)
+        # Live Photo videos are in --live-photo-directory when that was given
+        live_photo_dir = (
+            os.path.join(live_photo_directory, date_path) if live_photo_directory else download_dir
+        )
+
+        # the name the file was downloaded with (file match policy and filename cleaner applied)
+        base_filename = filename_builder(media)
 
         paths: Set[str] = set({})
         # Each media file's path with the sizes it may have, for a file that
@@ -92,12 +101,16 @@ def autodelete_photos(
         graduated_sizes: Dict[str, List[int]] = {}
         _size: VersionSize
         versions, filename_overrides = disambiguate_filenames(
-            media.versions_with_raw_policy(raw_policy), _sizes, media, lp_filename_generator
+            media.versions_with_raw_policy(raw_policy),
+            _sizes,
+            media,
+            lp_filename_generator,
+            base_filename,
         )
         for _size, _version in versions.items():
             if _size in [AssetVersionSize.ALTERNATIVE, AssetVersionSize.ADJUSTED]:
                 version_filename = calculate_version_filename(
-                    media.filename,
+                    base_filename,
                     _version,
                     _size,
                     lp_filename_generator,
@@ -116,15 +129,23 @@ def autodelete_photos(
         for _size, _version in media.versions_with_raw_policy(raw_policy).items():
             if _size not in [AssetVersionSize.ALTERNATIVE, AssetVersionSize.ADJUSTED]:
                 version_filename = calculate_version_filename(
-                    media.filename,
+                    base_filename,
                     _version,
                     _size,
                     lp_filename_generator,
                     media.item_type,
                 )
-                paths.add(os.path.normpath(local_download_path(version_filename, download_dir)))
+                if _size in [LivePhotoVersionSize.MEDIUM, LivePhotoVersionSize.THUMB]:
+                    # named like the download with --live-photo-size medium or thumb
+                    version_filename = add_suffix_to_filename(
+                        size_to_suffix(_size), version_filename
+                    )
+                version_dir = (
+                    live_photo_dir if isinstance(_size, LivePhotoVersionSize) else download_dir
+                )
+                paths.add(os.path.normpath(local_download_path(version_filename, version_dir)))
                 paths.add(
-                    os.path.normpath(local_download_path(version_filename, download_dir)) + ".xmp"
+                    os.path.normpath(local_download_path(version_filename, version_dir)) + ".xmp"
                 )
                 note_graduated(
                     graduated_sizes,

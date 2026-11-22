@@ -16,20 +16,18 @@
 
 See [Documentation](https://icloud-photos-downloader.github.io/icloud_photos_downloader/) for more details. Also, check [Issues](https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues)
 
-We aim to release new versions once a week (Friday), if there is something worth delivering.
-
 ## iCloud Prerequisites
 
 To make iCloud Photo Downloader work, ensure the iCloud account is configured with the following settings, otherwise Apple Servers will return an ACCESS_DENIED error:
 
-- **Enable Access iCloud Data on the Web:** On your iPhone / iPad, enable `Settings > Apple ID > iCloud > Access iCloud Data on the Web`
-- **Disable Advanced Data Protection:** On your iPhone /iPad disable `Settings > Apple ID > iCloud > Advanced Data Protection`
+- **Enable Access iCloud Data on the Web:** On your iPhone / iPad, enable `Settings > [your name] > iCloud > Access iCloud Data on the Web`
+- **Advanced Data Protection (ADP):** either disable `Settings > [your name] > iCloud > Advanced Data Protection` on your iPhone / iPad, or keep it enabled and run with `--adp-web-access` (see [Authentication](https://icloud-photos-downloader.github.io/icloud_photos_downloader/authentication.html#adp))
 
 
 ## Install and Run
 
 There are three ways to run `icloudpd`:
-1. Download executable for your platform from the GitHub [Release](https://github.com/icloud-photos-downloader/icloud_photos_downloader/releases/tag/v1.32.3) and run it
+1. Download executable for your platform from the GitHub [Release](https://github.com/icloud-photos-downloader/icloud_photos_downloader/releases/tag/v1.34.0) and run it (see [which file to download](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#which-file); the `icloud-*` files are a different tool)
 1. Use package manager to install, update, and, in some cases, run ([Docker](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#docker), [PyPI](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#pypi), [AUR](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#aur), [npm](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#npm))
 1. Build and run from the source
 
@@ -70,10 +68,29 @@ icloudpd --directory /data --username my@email.address --watch-with-interval 360
 > [!TIP]
 > Synchronization logic can be adjusted with command-line parameters. Run `icloudpd --help` to get full list.
 
+To move tracked local copies out of the active mirror when photos leave a shared library (including moves
+back to a participant's personal library), use a dedicated download directory:
+
+```bash
+icloudpd --directory /data/shared --username my@email.address \
+  --library 'SharedSync-YOUR-LIBRARY-ID' --prune-orphans
+```
+
+By default, tracking starts with newly written files and the first successful run
+only establishes a baseline. To also clean old orphans in an existing dedicated
+flat, original-size mirror, explicitly opt in to the one-time
+`--prune-orphans-adopt-existing` bootstrap and preview it with `--dry-run` first.
+
+Pruned files are moved into `.icloudpd-pruned/`, never permanently deleted: even
+consistent counts cannot prove Apple's listing is complete. Exclude that folder
+from gallery scans. Pruning problems warn without failing downloads. See
+[the option reference](docs/reference.md#prune-orphans-parameter) for ownership
+requirements, hashing costs and recovery instructions.
+
 To independently create and authorize a session (and complete 2SA/2FA validation if needed) on your local system:
 
 ```
-icloudpd --username my@email.address --password my_password --auth-only
+icloudpd --username my@email.address --auth-only
 ```
 > [!TIP]
 > This feature can also be used to check and verify that the session is still authenticated. 

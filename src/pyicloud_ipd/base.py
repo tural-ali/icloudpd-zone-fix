@@ -4,15 +4,18 @@ import hashlib
 import http.cookiejar as cookielib
 import json
 import logging
+import time
 import typing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from functools import partial
 from itertools import chain
-from os import mkdir, path
+from os import makedirs, mkdir, path
 from re import Pattern, match
 from tempfile import gettempdir
+from threading import Event
 from typing import Any, Callable, Dict, Generator, List, Mapping, NamedTuple, Sequence
-from uuid import uuid1
+from uuid import uuid1, uuid4
 
 import srp
 from requests import PreparedRequest, Request, Response
@@ -86,6 +89,7 @@ class PyiCloudService:
         client_id: str | None = None,
         with_family: bool = True,
         http_timeout: float = 30.0,
+        ignore_indexing_state: bool = False,
     ):
         self.apple_id = apple_id
         self.password_provider: Callable[[], str | None] = password_provider
@@ -94,6 +98,7 @@ class PyiCloudService:
         self.client_id: str = client_id or (f"auth-{str(uuid1()).lower()}")
         self.with_family = with_family
         self.http_timeout = http_timeout
+        self.ignore_indexing_state = ignore_indexing_state
         self.response_observer = response_observer
         self.observer_rules: Sequence[Rule] = []
 
@@ -117,8 +122,8 @@ class PyiCloudService:
 
         if cookie_directory:
             self._cookie_directory = path.expanduser(path.normpath(cookie_directory))
-            if not path.exists(self._cookie_directory):
-                mkdir(self._cookie_directory, 0o700)
+            # also create missing parent folders, e.g. --cookie-directory ~/icloudpd/cookies
+            makedirs(self._cookie_directory, 0o700, exist_ok=True)
         else:
             topdir = path.join(gettempdir(), "pyicloud")
             self._cookie_directory = path.join(topdir, getpass.getuser())
@@ -307,7 +312,11 @@ class PyiCloudService:
             password = self.password_provider()
             if not password:
                 LOGGER.debug("Password Provider did not give any data")
-                return None
+                raise PyiCloudFailedLoginException(
+                    f"Cannot log in as {self.apple_id}: the saved session is missing or no "
+                    "longer valid, and no password was provided. Run icloudpd with a password "
+                    "provider that can supply the password to sign in again."
+                )
             # set logging filter
             self.password_filter = PyiCloudPasswordFilter(password)
             LOGGER.addFilter(self.password_filter)
@@ -331,8 +340,9 @@ class PyiCloudService:
 
         self._webservices = self.data["webservices"]
 
-        LOGGER.info("Authentication completed successfully")
-        LOGGER.debug(self.params)
+        # icloudpd reports the result itself; the params hold the account's dsid, which
+        # shouldn't end up in logs pasted into issues
+        LOGGER.debug("Signed in to iCloud")
 
     def _authenticate_with_token(self) -> None:
         """Authenticate using session token."""
@@ -639,9 +649,9 @@ class PyiCloudService:
     def requires_2fa(self) -> bool:
         """Returns True if two-factor authentication is required."""
         return (
-            self.data["dsInfo"].get("hsaVersion", 0) == 2
+            self.data.get("dsInfo", {}).get("hsaVersion", 0) == 2
             and (self.data.get("hsaChallengeRequired", False) or not self.is_trusted_session)
-            and self.data["dsInfo"].get("hasICloudQualifyingDevice", False)
+            and self.data.get("dsInfo", {}).get("hasICloudQualifyingDevice", False)
         )
 
     @property
@@ -885,6 +895,189 @@ class PyiCloudService:
             LOGGER.error("Session trust failed.")
             return False
 
+    def get_security_key_challenge(self) -> Dict[str, Any] | None:
+        """Returns the WebAuthn challenge if the account signs in with security keys (FIDO)."""
+        headers = self._get_auth_headers({"Accept": "application/json"})
+        try:
+            if self.response_observer:
+                rules = list(
+                    chain(
+                        self.cookie_obfuscate_rules,
+                        self.header_obfuscate_rules,
+                        self.header_pass_rules,
+                        self.header_drop_rules,
+                    )
+                )
+            else:
+                rules = []
+
+            with self.use_rules(rules):
+                data = self.session.get(self.AUTH_ENDPOINT, headers=headers).json()
+        except (PyiCloudAPIResponseException, ValueError):
+            return None
+
+        challenge = data.get("fsaChallenge") if isinstance(data, dict) else None
+        if not isinstance(challenge, dict) or not all(
+            challenge.get(key) for key in ("challenge", "keyHandles", "rpId")
+        ):
+            return None
+        return {**challenge, "keyNames": data.get("keyNames") or []}
+
+    def confirm_security_key(self, challenge: Mapping[str, Any]) -> bool:
+        """Signs the challenge with the security key that is touched and trusts the session."""
+        # fido2 loads cryptography, so import it only for accounts that use security keys
+        from fido2.client import ClientError, DefaultClientDataCollector, Fido2Client
+        from fido2.hid import CtapHidDevice
+        from fido2.webauthn import (
+            AuthenticationResponse,
+            PublicKeyCredentialDescriptor,
+            PublicKeyCredentialRequestOptions,
+            PublicKeyCredentialType,
+            UserVerificationRequirement,
+        )
+
+        def b64url_decode(value: str) -> bytes:
+            return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+        def b64_encode(value: bytes) -> str:
+            return base64.b64encode(value).decode()
+
+        devices = list(CtapHidDevice.list_devices())
+        if not devices:
+            LOGGER.error("No security key found")
+            return False
+
+        options = PublicKeyCredentialRequestOptions(
+            challenge=b64url_decode(challenge["challenge"]),
+            rp_id=challenge["rpId"],
+            allow_credentials=[
+                PublicKeyCredentialDescriptor(
+                    id=b64url_decode(key_handle), type=PublicKeyCredentialType.PUBLIC_KEY
+                )
+                for key_handle in challenge["keyHandles"]
+            ],
+            user_verification=UserVerificationRequirement.DISCOURAGED,
+        )
+        cancel = Event()
+
+        def sign(device: CtapHidDevice) -> AuthenticationResponse:
+            client = Fido2Client(
+                device, client_data_collector=DefaultClientDataCollector("https://apple.com")
+            )
+            return client.get_assertion(options, event=cancel).get_response(0)
+
+        # Like a browser: ask every key, use the first one touched
+        assertion = None
+        with ThreadPoolExecutor(len(devices)) as executor:
+            try:
+                for future in as_completed([executor.submit(sign, device) for device in devices]):
+                    try:
+                        assertion = future.result()
+                        break
+                    except ClientError as error:
+                        LOGGER.error("Security key confirmation failed: %s", error)
+            finally:
+                cancel.set()
+        if assertion is None:
+            return False
+
+        user_handle = assertion.response.user_handle
+        data = {
+            "challenge": challenge["challenge"],
+            "clientData": b64_encode(assertion.response.client_data),
+            "signatureData": b64_encode(assertion.response.signature),
+            "authenticatorData": b64_encode(assertion.response.authenticator_data),
+            "userHandle": b64_encode(user_handle) if user_handle else None,
+            "credentialID": b64_encode(assertion.raw_id),
+            "rpId": challenge["rpId"],
+        }
+        headers = self._get_auth_headers({"Accept": "application/json"})
+        try:
+            if self.response_observer:
+                rules = list(
+                    chain(
+                        self.cookie_obfuscate_rules,
+                        self.header_obfuscate_rules,
+                        self.header_pass_rules,
+                        self.header_drop_rules,
+                    )
+                )
+            else:
+                rules = []
+
+            with self.use_rules(rules):
+                self.session.post(
+                    f"{self.AUTH_ENDPOINT}/verify/security/key",
+                    data=json.dumps(data),
+                    headers=headers,
+                )
+        except PyiCloudAPIResponseException:
+            LOGGER.error("Security key verification failed.")
+            return False
+
+        LOGGER.debug("Security key verification successful.")
+        return self.trust_session()
+
+    def request_pcs_consent(self, app_name: str = "photos", timeout_seconds: int = 120) -> None:
+        """Replay the icloud.com sequence that unlocks PCS protected data (Advanced Data Protection).
+
+        Needs "Access iCloud Data on the Web" enabled on the account. The first call sends a
+        notification to the user's Apple devices that must be approved; once consented, later
+        calls skip straight to requestPCS.
+        """
+        workflow = {"workflowUuid": str(uuid4()).upper()}
+        params = {**self.params, "clientId": self.client_id}
+
+        def call(method: str, name: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            response = self.session.request(
+                method,
+                f"{self.SETUP_ENDPOINT}/{name}",
+                params=params,
+                headers={"Content-Type": "text/plain;charset=UTF-8"},
+                **({"data": json.dumps(body)} if body is not None else {}),
+            )
+            return typing.cast(Dict[str, Any], response.json())
+
+        state = call("POST", "requestWebAccessState", workflow)
+        if not state.get("isWebAccessAllowed"):
+            raise PyiCloudFailedLoginException(
+                "Web access to iCloud data is disabled: "
+                "enable 'Access iCloud Data on the Web' on your Apple device"
+            )
+        if not state.get("isDeviceConsentedForPCS"):
+            call("POST", "enableDeviceConsentForPCS", workflow)
+            LOGGER.info(
+                "Approve the iCloud web access request on your Apple device (waiting %ss)",
+                timeout_seconds,
+            )
+            deadline = time.monotonic() + timeout_seconds
+            while not state.get("isDeviceConsentedForPCS"):
+                if time.monotonic() > deadline:
+                    raise PyiCloudFailedLoginException(
+                        "Timed out waiting for the iCloud web access approval"
+                    )
+                time.sleep(3)
+                state = call("POST", "requestWebAccessState", workflow)
+        call("GET", "generateSessionIdToken")
+
+        pcs = {"appName": app_name, "isFinalAttempt": False, **workflow}
+        result = call("POST", "requestPCS", {"derivedFromUserAction": True, **pcs})
+        for _ in range(10):
+            if result.get("status") == "success":
+                break
+            time.sleep(3)
+            result = call("POST", "requestPCS", {"derivedFromUserAction": False, **pcs})
+        LOGGER.debug(
+            "requestPCS: status=%s message=%s", result.get("status"), result.get("message")
+        )
+        if result.get("status") != "success":
+            LOGGER.warning(
+                "iCloud did not confirm web access to %s data (status=%s); "
+                "downloads may fail with ACCESS_DENIED",
+                app_name,
+                result.get("status"),
+            )
+
     def _get_webservice_url(self, ws_key: str) -> str:
         """Get webservice URL, raise an exception if not exists."""
         if self._webservices.get(ws_key) is None:
@@ -896,7 +1089,12 @@ class PyiCloudService:
         """Gets the 'Photo' service."""
         if not self._photos:
             service_root = self._get_webservice_url("ckdatabasews")
-            self._photos = PhotosService(service_root, self.session, self.params)
+            self._photos = PhotosService(
+                service_root,
+                self.session,
+                self.params,
+                ignore_indexing_state=self.ignore_indexing_state,
+            )
         return self._photos
 
     def __unicode__(self) -> str:

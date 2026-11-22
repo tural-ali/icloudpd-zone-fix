@@ -5,18 +5,19 @@ import pathlib
 import sys
 from itertools import dropwhile
 from operator import eq, not_
-from typing import Any, Callable, Iterable, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Sequence, Tuple
 
 from tzlocal import get_localzone
 
 import foundation
 from foundation.core import chain_from_iterable, compose, map_, partial_1_1, skip
 from foundation.string_utils import lower
-from icloudpd.base import ensure_tzinfo, run_with_configs
+from icloudpd.base import ensure_tzinfo, offset_to_datetime, run_with_configs
 from icloudpd.config import GlobalConfig, UserConfig
 from icloudpd.log_level import LogLevel
 from icloudpd.mfa_provider import MFAProvider
 from icloudpd.password_provider import PasswordProvider
+from icloudpd.prune import MEDIA_EXTENSIONS
 from icloudpd.string_helpers import parse_timestamp_or_timedelta, splitlines
 from pyicloud_ipd.file_match import FileMatchPolicy
 from pyicloud_ipd.live_photo_mov_filename_policy import LivePhotoMovFilenamePolicy
@@ -44,6 +45,12 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
     )
     cloned.add_argument(
         "--auth-only", action="store_true", help="Create/update cookie and session tokens only."
+    )
+    cloned.add_argument(
+        "--adp-web-access",
+        action="store_true",
+        help="Request iCloud web access consent for accounts with Advanced Data Protection (ADP). "
+        "Requires approving a notification on an Apple device the first time.",
     )
     cloned.add_argument(
         "--cookie-directory",
@@ -110,13 +117,30 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         action="store_true",
     )
     cloned.add_argument(
+        "--skip-screenshots",
+        help="Don't download screenshots (default: download screenshots)",
+        action="store_true",
+    )
+    cloned.add_argument(
         "--skip-live-photos",
         help="Don't download any live photos (default: download live photos)",
         action="store_true",
     )
     cloned.add_argument(
+        "--live-photo-directory",
+        help="Download the video part of Live Photos to this directory instead of next to the "
+        + "photo. The folder structure is applied inside it, like in --directory "
+        + "(default: next to the photo)",
+        default=None,
+    )
+    cloned.add_argument(
         "--xmp-sidecar",
         help="Export additional data as XMP sidecar files (default: don't export)",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--xmp-sidecar-only",
+        help="Only write the XMP sidecar files, without downloading the photos and videos (default: download them)",
         action="store_true",
     )
     cloned.add_argument(
@@ -128,6 +152,20 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         "--auto-delete",
         help='Scan the "Recently Deleted" folder and delete any files found there. '
         + "(If you restore the photo in iCloud, it will be downloaded again.)",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--prune-orphans",
+        help="Move tracked downloads that disappeared from a shared library into .icloudpd-pruned/. "
+        + "Newly written files are tracked by default; existing files require explicit adoption. "
+        + "Requires a dedicated directory and a complete, nonempty library listing.",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--prune-orphans-adopt-existing",
+        help="On the first successful pruning run, adopt an existing dedicated flat, original-size "
+        + "shared-library mirror and quarantine unmatched media. Declares existing media managed; "
+        + "preview with --dry-run first. Requires --prune-orphans and unchanged naming settings.",
         action="store_true",
     )
     cloned.add_argument(
@@ -256,6 +294,26 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         help="Don't download any photos (default: download all photos and videos)",
         action="store_true",
     )
+    cloned.add_argument(
+        "--exclude-filename",
+        help="Don't download assets whose filename matches the pattern, e.g. `IMG_12*.JPG`. "
+        "Matching ignores case. Can be used several times",
+        action="append",
+        dest="exclude_filenames",
+    )
+    cloned.add_argument(
+        "--temp-suffix",
+        help="Suffix of the temporary files used while a download is in progress, "
+        "must start with a dot (default: %(default)s)",
+        type=validate_temp_suffix,
+        default=".part",
+    )
+    cloned.add_argument(
+        "--ignore-indexing-state",
+        help="Continue when iCloud keeps reporting the library as still indexing; the listing "
+        "may then be incomplete. Can't be combined with options that delete",
+        action="store_true",
+    )
     return cloned
 
 
@@ -358,6 +416,11 @@ def add_global_options(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         default="console",
         type=lower,
     )
+    cloned.add_argument(
+        "--webui-host",
+        help="Address the WebUI server listens on. Use 127.0.0.1 to allow access from this computer only. Default: %(default)s",
+        default="0.0.0.0",
+    )
     return cloned
 
 
@@ -402,7 +465,12 @@ def format_help() -> str:
 
     extract_option_lines = compose(skip_to_options, help_in_lines)
 
-    dummy_parser = argparse.ArgumentParser(exit_on_error=False, add_help=False, allow_abbrev=False)
+    # without colors: from Python 3.14 argparse colors the help in a terminal, and the
+    # "options:" header the lines are cut at would not match (#1474)
+    no_color: Dict[str, Any] = {"color": False} if sys.version_info >= (3, 14) else {}
+    dummy_parser = argparse.ArgumentParser(
+        exit_on_error=False, add_help=False, allow_abbrev=False, **no_color
+    )
 
     global_help = compose(extract_option_lines, add_global_options)(dummy_parser)
 
@@ -434,11 +502,12 @@ def map_to_config(user_ns: argparse.Namespace) -> UserConfig:
         password=user_ns.password,
         directory=user_ns.directory,
         auth_only=user_ns.auth_only,
+        adp_web_access=user_ns.adp_web_access,
         cookie_directory=user_ns.cookie_directory,
         sizes=list(
             map_(AssetVersionSize, foundation.unique_sequence(user_ns.sizes or ["original"]))
         ),
-        live_photo_size=LivePhotoVersionSize(user_ns.live_photo_size),
+        live_photo_size=LivePhotoVersionSize[user_ns.live_photo_size.upper()],
         recent=user_ns.recent,
         until_found=user_ns.until_found,
         albums=user_ns.albums,
@@ -447,9 +516,12 @@ def map_to_config(user_ns: argparse.Namespace) -> UserConfig:
         list_libraries=user_ns.list_libraries,
         skip_videos=user_ns.skip_videos,
         skip_live_photos=user_ns.skip_live_photos,
-        xmp_sidecar=user_ns.xmp_sidecar,
+        live_photo_directory=user_ns.live_photo_directory,
+        xmp_sidecar=user_ns.xmp_sidecar or user_ns.xmp_sidecar_only,
         force_size=user_ns.force_size,
         auto_delete=user_ns.auto_delete,
+        prune_orphans=user_ns.prune_orphans,
+        prune_orphans_adopt_existing=user_ns.prune_orphans_adopt_existing,
         folder_structure=user_ns.folder_structure,
         set_exif_datetime=user_ns.set_exif_datetime,
         smtp_username=user_ns.smtp_username,
@@ -472,6 +544,11 @@ def map_to_config(user_ns: argparse.Namespace) -> UserConfig:
         skip_created_before=user_ns.skip_created_before,
         skip_created_after=user_ns.skip_created_after,
         skip_photos=user_ns.skip_photos,
+        skip_screenshots=user_ns.skip_screenshots,
+        exclude_filenames=tuple(user_ns.exclude_filenames or ()),
+        temp_suffix=user_ns.temp_suffix,
+        xmp_sidecar_only=user_ns.xmp_sidecar_only,
+        ignore_indexing_state=user_ns.ignore_indexing_state,
     )
 
 
@@ -528,6 +605,7 @@ def parse(args: Sequence[str]) -> Tuple[GlobalConfig, Sequence[UserConfig]]:
                 )
             ),
             mfa_provider=MFAProvider(global_ns.mfa_provider),
+            webui_host=global_ns.webui_host,
         ),
         user_nses,
     )
@@ -540,9 +618,16 @@ def cli() -> int:
         print(error)
         return 2
     if global_ns.use_os_locale:
-        from locale import LC_ALL, setlocale
+        from locale import LC_ALL, Error, setlocale
 
-        setlocale(LC_ALL, "")
+        try:
+            setlocale(LC_ALL, "")
+        except Error as error:
+            # e.g. LANG/LC_ALL names a locale that isn't installed (common in containers)
+            print(
+                f"Cannot use the system locale ({error}), using the default locale",
+                file=sys.stderr,
+            )
     else:
         pass
     if global_ns.help:
@@ -573,6 +658,108 @@ def cli() -> int:
             )
             return 2
 
+        elif any(
+            user_ns.ignore_indexing_state
+            and (
+                user_ns.auto_delete
+                or user_ns.delete_after_download
+                or user_ns.keep_icloud_recent_days is not None
+                or user_ns.prune_orphans
+            )
+            for user_ns in user_nses
+        ):
+            # a listing that is really incomplete must never lead to deletions (#1387)
+            print(
+                "--ignore-indexing-state cannot be combined with --auto-delete, "
+                "--delete-after-download, --keep-icloud-recent-days or --prune-orphans"
+            )
+            return 2
+
+        elif any(
+            user_ns.live_photo_directory and (user_ns.skip_live_photos or user_ns.prune_orphans)
+            for user_ns in user_nses
+        ):
+            print(
+                "--live-photo-directory can't be combined with --skip-live-photos or "
+                "--prune-orphans"
+            )
+            return 2
+
+        elif any(
+            user_ns.prune_orphans_adopt_existing
+            and (
+                not user_ns.prune_orphans
+                or user_ns.folder_structure.lower() != "none"
+                or set(user_ns.sizes) != {AssetVersionSize.ORIGINAL}
+                or user_ns.live_photo_size != LivePhotoVersionSize.ORIGINAL
+                or user_ns.skip_live_photos
+                or user_ns.align_raw != RawTreatmentPolicy.AS_IS
+                or user_ns.file_match_policy != FileMatchPolicy.NAME_SIZE_DEDUP_WITH_SUFFIX
+                or user_ns.live_photo_mov_filename_policy != LivePhotoMovFilenamePolicy.SUFFIX
+            )
+            for user_ns in user_nses
+        ):
+            print(
+                "--prune-orphans-adopt-existing requires --prune-orphans, --folder-structure none, "
+                "original photo/video sizes, live photos enabled, --align-raw as-is, "
+                "--file-match-policy name-size-dedup-with-suffix and "
+                "--live-photo-mov-filename-policy suffix"
+            )
+            return 2
+
+        elif any(
+            user_ns.prune_orphans
+            and (
+                user_ns.library == "PrimarySync"
+                or user_ns.delete_after_download
+                or user_ns.keep_icloud_recent_days is not None
+                or global_ns.only_print_filenames
+            )
+            for user_ns in user_nses
+        ):
+            print(
+                "--prune-orphans requires --library and cannot be combined with "
+                "--delete-after-download, --keep-icloud-recent-days or --only-print-filenames"
+            )
+            return 2
+
+        elif any(
+            user_ns.xmp_sidecar_only
+            and (
+                user_ns.prune_orphans
+                or user_ns.delete_after_download
+                or user_ns.keep_icloud_recent_days is not None
+                or user_ns.until_found is not None
+                or global_ns.only_print_filenames
+            )
+            for user_ns in user_nses
+        ):
+            # without the media files nothing is kept locally, so nothing may be deleted from iCloud
+            print(
+                "--xmp-sidecar-only cannot be combined with --prune-orphans, --delete-after-download, "
+                "--keep-icloud-recent-days, --until-found or --only-print-filenames"
+            )
+            return 2
+
+        elif any(
+            first.prune_orphans
+            and first.directory
+            and second.directory
+            and (
+                pathlib.Path(first.directory)
+                .resolve()
+                .is_relative_to(pathlib.Path(second.directory).resolve())
+                or pathlib.Path(second.directory)
+                .resolve()
+                .is_relative_to(pathlib.Path(first.directory).resolve())
+            )
+            for first in user_nses
+            for second in user_nses
+            if first is not second
+        ):
+            print("--prune-orphans requires a dedicated, non-overlapping download directory")
+            return 2
+
         elif [
             user_ns
             for user_ns in user_nses
@@ -586,10 +773,34 @@ def cli() -> int:
         elif [
             user_ns
             for user_ns in user_nses
-            if user_ns.keep_icloud_recent_days and user_ns.delete_after_download
+            if user_ns.keep_icloud_recent_days is not None and user_ns.delete_after_download
         ]:
             print(
                 "--keep-icloud-recent-days and --delete-after-download should not be used together in one configuration"
+            )
+            return 2
+
+        elif [
+            user_ns
+            for user_ns in user_nses
+            if user_ns.keep_icloud_recent_days is not None and user_ns.auto_delete
+        ]:
+            # assets --keep-icloud-recent-days moves to Recently Deleted would be deleted locally too
+            print(
+                "--keep-icloud-recent-days and --auto-delete should not be used together in one configuration"
+            )
+            return 2
+
+        elif [
+            user_ns
+            for user_ns in user_nses
+            if user_ns.skip_created_before is not None
+            and user_ns.skip_created_after is not None
+            and offset_to_datetime(user_ns.skip_created_before)
+            > offset_to_datetime(user_ns.skip_created_after)
+        ]:
+            print(
+                "--skip-created-before must be earlier than --skip-created-after, otherwise no assets can match"
             )
             return 2
 
@@ -607,6 +818,27 @@ def cli() -> int:
             return 2
         else:
             return run_with_configs(global_ns, user_nses)
+
+
+def validate_temp_suffix(suffix: str) -> str:
+    if not suffix or "/" in suffix or "\\" in suffix:
+        raise argparse.ArgumentTypeError(
+            f"Suffix {suffix!r} specified in --temp-suffix must not be empty or contain a path separator"
+        )
+    # Without a leading dot the suffix glues onto the extension ("jpg" makes "x.jpg"
+    # end in "jpg"), so --prune-orphans would take every photo for a temporary file
+    if not suffix.startswith("."):
+        raise argparse.ArgumentTypeError(
+            f"Suffix {suffix!r} specified in --temp-suffix must start with a dot, e.g. .{suffix}"
+        )
+    # A leftover temporary file must not look like media or a sidecar, or indexers and
+    # --prune-orphans-adopt-existing would treat it as one
+    extension = pathlib.PurePath("x" + suffix).suffix.lower()
+    if extension in MEDIA_EXTENSIONS or extension == ".xmp":
+        raise argparse.ArgumentTypeError(
+            f"Suffix {suffix!r} specified in --temp-suffix must not end with a media or sidecar extension"
+        )
+    return suffix
 
 
 def validate_folder_structure(folder_structure: str) -> str:

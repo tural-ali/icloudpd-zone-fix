@@ -347,6 +347,117 @@ class AutodeletePhotosTestCase(TestCase):
                 f"{file_name} not expected, but present"
             )
 
+    def test_autodelete_photos_name_id7(self) -> None:
+        """--auto-delete finds the local files by the names name-id7 gave them"""
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        cookie_dir = os.path.join(base_dir, "cookie")
+        data_dir = os.path.join(base_dir, "data")
+        cookie_master_path = os.path.join(self.root_path, "cookie")
+
+        for dir in [base_dir, data_dir]:
+            recreate_path(dir)
+
+        shutil.copytree(cookie_master_path, cookie_dir)
+
+        files_to_create = ["2018/07/30/IMG_7407.JPG", "2018/07/30/IMG_7407-original.JPG"]
+
+        files_to_delete = [
+            f"{f'{datetime.datetime.fromtimestamp(1532940539000.0 / 1000.0, tz=pytz.utc).astimezone(get_localzone()):%Y/%m/%d}'}/IMG_7406_QVIxdkx.MOV",
+            f"{f'{datetime.datetime.fromtimestamp(1532618424000.0 / 1000.0, tz=pytz.utc).astimezone(get_localzone()):%Y/%m/%d}'}/IMG_7383_QWZsQlV.PNG",
+            f"{f'{datetime.datetime.fromtimestamp(1531371164630.0 / 1000.0, tz=pytz.utc).astimezone(get_localzone()):%Y/%m/%d}'}/IMG_7190_QWRnZXp.JPG",
+            f"{f'{datetime.datetime.fromtimestamp(1531371164630.0 / 1000.0, tz=pytz.utc).astimezone(get_localzone()):%Y/%m/%d}'}/IMG_7190_QWRnZXp-medium.JPG",
+        ]
+
+        os.makedirs(
+            os.path.join(
+                data_dir,
+                f"{f'{datetime.datetime.fromtimestamp(1532940539000.0 / 1000.0, tz=pytz.utc).astimezone(get_localzone()):%Y/%m/%d}'}/",
+            )
+        )
+        os.makedirs(
+            os.path.join(
+                data_dir,
+                f"{f'{datetime.datetime.fromtimestamp(1532618424000.0 / 1000.0, tz=pytz.utc).astimezone(get_localzone()):%Y/%m/%d}'}/",
+            )
+        )
+        os.makedirs(
+            os.path.join(
+                data_dir,
+                f"{f'{datetime.datetime.fromtimestamp(1531371164630.0 / 1000.0, tz=pytz.utc).astimezone(get_localzone()):%Y/%m/%d}'}/",
+            )
+        )
+
+        # create some empty files
+        for file_name in files_to_create + files_to_delete:
+            open(os.path.join(data_dir, file_name), "a").close()
+
+        result = run_cassette(
+            os.path.join(self.vcr_path, "autodelete_photos.yml"),
+            [
+                "--username",
+                "jdoe@gmail.com",
+                "--password",
+                "password1",
+                "--recent",
+                "0",
+                "--skip-videos",
+                "--auto-delete",
+                "-d",
+                data_dir,
+                "--cookie-directory",
+                cookie_dir,
+                "--file-match-policy",
+                "name-id7",
+            ],
+        )
+        self.assertIn("Looking up all photos...", result.output)
+        self.assertIn(
+            f"Downloading 0 original photos to {data_dir} ...",
+            result.output,
+        )
+        self.assertIn("All photos have been downloaded", result.output)
+        self.assertIn(
+            "Deleting any files found in 'Recently Deleted'...",
+            result.output,
+        )
+
+        self.assertIn(
+            f"Deleted {os.path.join(data_dir, os.path.normpath(files_to_delete[0]))}",
+            result.output,
+        )
+        self.assertIn(
+            f"Deleted {os.path.join(data_dir, os.path.normpath(files_to_delete[1]))}",
+            result.output,
+        )
+        self.assertIn(
+            f"Deleted {os.path.join(data_dir, os.path.normpath(files_to_delete[2]))}",
+            result.output,
+        )
+        self.assertIn(
+            f"Deleted {os.path.join(data_dir, os.path.normpath(files_to_delete[3]))}",
+            result.output,
+        )
+
+        self.assertNotIn("IMG_7407.JPG", result.output)
+        self.assertNotIn("IMG_7407-original.JPG", result.output)
+
+        self.assertEqual(result.exit_code, 0, "Exit code")
+
+        files_in_result = glob.glob(os.path.join(data_dir, "**/*.*"), recursive=True)
+
+        assert sum(1 for _ in files_in_result) == len(files_to_create)
+
+        # check files
+        for file_name in files_to_create:
+            assert os.path.exists(os.path.join(data_dir, file_name)), (
+                f"{file_name} expected, but missing"
+            )
+
+        for file_name in files_to_delete:
+            assert not os.path.exists(os.path.join(data_dir, file_name)), (
+                f"{file_name} not expected, but present"
+            )
+
     @pytest.mark.skipif(constants.MAX_RETRIES == 0, reason="Disabled when MAX_RETRIES set to 0")
     def test_retry_delete_after_download_session_error(self) -> None:
         base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
@@ -1082,4 +1193,62 @@ class AutodeletePhotosTestCase(TestCase):
         for file_name in files_to_delete:
             assert not os.path.exists(os.path.join(data_dir, file_name)), (
                 f"{file_name} not expected, but present"
+            )
+
+    def test_autodelete_photos_lp_medium_and_thumb(self) -> None:
+        """Live Photo videos downloaded with --live-photo-size medium or thumb get a -medium or
+        -thumb suffix, and --auto-delete has to look for that name too"""
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        cookie_dir = os.path.join(base_dir, "cookie")
+        data_dir = os.path.join(base_dir, "data")
+        cookie_master_path = os.path.join(self.root_path, "cookie")
+
+        for dir in [base_dir, data_dir]:
+            recreate_path(dir)
+
+        shutil.copytree(cookie_master_path, cookie_dir)
+
+        files_to_create = ["2018/07/30/IMG_7407.JPG"]
+
+        files_to_delete = [
+            "2018/07/12/IMG_7190.JPG",
+            "2018/07/12/IMG_7190-medium.MOV",  # --live-photo-size medium
+            "2018/07/12/IMG_7190-thumb.MOV",  # --live-photo-size thumb
+        ]
+
+        for file_name in files_to_create + files_to_delete:
+            path_name, _ = os.path.split(file_name)
+            os.makedirs(os.path.join(data_dir, path_name), exist_ok=True)
+            open(os.path.join(data_dir, file_name), "a").close()
+
+        result = run_cassette(
+            os.path.join(self.vcr_path, "autodelete_photos.yml"),
+            [
+                "--username",
+                "jdoe@gmail.com",
+                "--password",
+                "password1",
+                "--recent",
+                "0",
+                "--skip-videos",
+                "--live-photo-size",
+                "medium",
+                "--auto-delete",
+                "-d",
+                data_dir,
+                "--cookie-directory",
+                cookie_dir,
+            ],
+        )
+        self.assertEqual(result.exit_code, 0, "exit code")
+        for file_name in files_to_delete:
+            self.assertIn(
+                f"Deleted {os.path.join(data_dir, os.path.normpath(file_name))}", result.output
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(data_dir, file_name)), f"{file_name} still present"
+            )
+        for file_name in files_to_create:
+            self.assertTrue(
+                os.path.exists(os.path.join(data_dir, file_name)), f"{file_name} missing"
             )
