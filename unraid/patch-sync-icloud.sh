@@ -10,9 +10,16 @@
 # checks the exit code and output of `icloudpd --list-libraries` instead of
 # treating every printed line as a library name (see that file).
 #
-# Fails the build if upstream renames either function, or changes the body of
-# resolve_library_list, so a change can never silently disappear from, or
-# silently override, a weekly rebuild.
+# flag_incomplete_download: also accepts the line icloudpd ends with after
+# --ignore-indexing-state ("All photos and videos that iCloud listed have been
+# downloaded, but the listing may be incomplete: ..."), which the indexing
+# fallback (unraid/icloudpd-indexing-fallback.sh) leads to. Without this, every
+# such run that downloaded what iCloud listed would be reported as failed.
+#
+# Fails the build if upstream renames any of these functions, changes the body
+# of resolve_library_list, or rewords the check in flag_incomplete_download, so
+# a change can never silently disappear from, or silently override, a weekly
+# rebuild.
 set -eu
 f="${1:-/usr/local/bin/sync-icloud.sh}"
 here="$(dirname "$0")"
@@ -48,3 +55,16 @@ awk -v repl="$here/resolve-library-list.sh" '
 cat "$f.new" > "$f"
 rm -f "$f.new"
 echo "patch-sync-icloud: resolve_library_list checks the library listing"
+
+old='All (photos and videos|photos|videos) have been downloaded'
+new='All (photos and videos|photos|videos) (that iCloud listed )?have been downloaded'
+awk -v old="$old" -v new="$new" '
+  /^flag_incomplete_download\(\)/ { f = 1 }
+  f && (i = index($0, old)) { $0 = substr($0, 1, i - 1) new substr($0, i + length(old)); n++ }
+  f && /^}/ { f = 0 }
+  { print }
+  END { if (n != 1) exit 1 }
+' "$f" > "$f.new" || { rm -f "$f.new"; echo "patch-sync-icloud: the check in flag_incomplete_download() changed or is missing in $f" >&2; exit 1; }
+cat "$f.new" > "$f"
+rm -f "$f.new"
+echo "patch-sync-icloud: flag_incomplete_download accepts a run that downloaded what iCloud listed"
